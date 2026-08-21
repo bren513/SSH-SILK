@@ -1,0 +1,174 @@
+#!/bin/bash
+# =========================================================
+# SCRIPT: SSH SILK - INSTALADOR REMOTO UNIVERSAL
+# COMPATIBLE CON: UBUNTU 20.04 / 22.04 / 24.04 Y DEBIAN
+# =========================================================
+
+# Verificar que se ejecute como root
+if [ "$EUID" -ne 0 ]; then
+  echo -e "\e[1;31m❌ Por favor, ejecuta este script como root (sudo).\e[0m"
+  exit 1
+fi
+
+# ⚙️ AUTO-INSTALACIÓN DE DEPENDENCIAS (Para VPS nuevos)
+echo -e "\e[1;36m🔍 Verificando dependencias del sistema...\e[0m"
+apt-get update -y &>/dev/null
+DEPENDENCIAS=(lsb-release ufw bc gawk host)
+for dep in "${DEPENDENCIAS[@]}"; do
+    if ! command -v "$dep" &>/dev/null && [ ! -f "/usr/bin/$dep" ]; then
+        echo -e "\e[1;33m📦 Instalando $dep...\e[0m"
+        apt-get install -y "$dep" &>/dev/null
+    fi
+done
+
+# Colores ANSI para la interfaz gráfica
+VERDE="\e[1;32m"
+ROJO="\e[1;31m"
+AZUL="\e[1;34m"
+CIAN="\e[1;36m"
+AMARILLO="\e[1;33m"
+MAGENTA="\e[1;35m"
+BLANCO="\e[1;37m"
+FIN="\e[0m"
+
+# Función para obtener métricas del hardware en tiempo real
+obtener_info_sistema() {
+    OS=$(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep "PRETTY_NAME" | cut -d= -f2 | tr -d '"')
+    HORA=$(date +"%H:%M:%S")
+    NUCLEOS=$(nproc)
+    RAM_TOTAL=$(free -h | grep Mem | awk '{print $2}')
+    RAM_USO_PCT=$(free | grep Mem | awk '{print int($3/$2 * 100)}')
+    CPU_USO_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print int(100 - $1)}')
+    TOTAL_USERS=$(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd | wc -l)
+    ONLINE_USERS=$(ps aux | grep -i sshd | grep -v grep | wc -l)
+    
+    # Calcular usuarios vencidos
+    HOY=$(date +%s)
+    VENCIDOS=0
+    for user in $(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd); do
+        EXP_DATE=$(chage -l "$user" | grep "Account expires" | cut -d: -f2)
+        if [[ "$EXP_DATE" != *"never"* && -n "$EXP_DATE" ]]; then
+            EXP_SEC=$(date -d "$EXP_DATE" +%s 2>/dev/null)
+            if [ -n "$EXP_SEC" ] && [ "$EXP_SEC" -lt "$HOY" ]; then
+                VENCIDOS=$((VENCIDOS + 1))
+            fi
+        fi
+    done
+}
+
+# Generador visual de las barras de carga
+dibujar_barra() {
+    local pct=$1
+    local total_bloques=10
+    local bloques_llenos=$((pct / 10))
+    local bloques_vacios=$((total_bloques - bloques_llenos))
+    printf "["
+    for ((i=0; i<bloques_llenos; i++)); do printf "■"; done
+    for ((i=0; i<bloques_vacios; i++)); do printf " "; done
+    printf "] %d%%" "$pct"
+}
+
+# Funciones del Menú de Administración
+crear_usuario() {
+    clear
+    echo -e "${VERDE}⚡ SSH SILK - CREAR NUEVO USUARIO ${FIN}"
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "👤 Nombre de usuario: " usuario
+    if id "$usuario" &>/dev/null; then
+        echo -e "${ROJO}❌ Error: El usuario ya existe.${FIN}"
+    else
+        read -p "🔑 Contraseña: " contrasena
+        read -p "⏳ Días de duración: " dias
+        FECHA_EXP=$(date -d "+$dias days" +%Y-%m-%d)
+        useradd -M -s /bin/false -e "$FECHA_EXP" "$usuario"
+        echo "$usuario:$contrasena" | chpasswd
+        echo -e "\n${VERDE}✅ ¡Usuario registrado exitosamente!${FIN}"
+        echo -e "👤 Usuario: ${CIAN}$usuario${FIN}"
+        echo -e "⏳ Vence el: ${AMARILLO}$FECHA_EXP${FIN}"
+    fi
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "Presione Enter para regresar..."
+}
+
+crear_test() {
+    clear
+    echo -e "${AMARILLO}⚡ SSH SILK - CREAR CUENTA TEST ${FIN}"
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    USER_TEST="silk$(date +%s | tail -c 4)"
+    PASS_TEST="1234"
+    FECHA_EXP=$(date -d "+1 day" +%Y-%m-%d)
+    useradd -M -s /bin/false -e "$FECHA_EXP" "$USER_TEST"
+    echo "$USER_TEST:$PASS_TEST" | chpasswd
+    echo -e "${VERDE}✅ Cuenta de prueba temporal creada:${FIN}"
+    echo -e "👤 Usuario: ${CIAN}$USER_TEST${FIN}"
+    echo -e "🔑 Contraseña: ${BLANCO}$PASS_TEST${FIN}"
+    echo -e "⏳ Expiración: En 24 horas automáticamente."
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "Presione Enter para regresar..."
+}
+
+eliminar_usuario() {
+    clear
+    echo -e "${ROJO}⚡ SSH SILK - ELIMINAR USUARIO ${FIN}"
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "👤 Ingrese el usuario a eliminar: " usuario
+    if id "$usuario" &>/dev/null; then
+        userdel -f "$usuario"
+        echo -e "${VERDE}✅ Usuario $usuario eliminado de raíz.${FIN}"
+    else
+        echo -e "${ROJO}❌ El usuario ingresado no existe.${FIN}"
+    fi
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "Presione Enter para regresar..."
+}
+
+abrir_puerto() {
+    clear
+    echo -e "${CIAN}⚡ SSH SILK - CONFIGURAR CORTAFUEGOS ${FIN}"
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "🔢 Número de puerto a liberar: " puerto
+    read -p "🌐 Tipo de protocolo (tcp/udp): " proto
+    if command -v ufw &>/dev/null; then
+        ufw allow "$puerto/$proto" &>/dev/null
+        ufw reload &>/dev/null
+        echo -e "${VERDE}✅ Puerto $puerto/$proto abierto en UFW.${FIN}"
+    else
+        iptables -A INPUT -p "$proto" --dport "$puerto" -j ACCEPT
+        echo -e "${VERDE}✅ Puerto $puerto/$proto configurado en iptables.${FIN}"
+    fi
+    echo -e "${AZUL}-----------------------------------------------${FIN}"
+    read -p "Presione Enter para regresar..."
+}
+
+# Bucle principal de renderizado del menú interactivo
+while true; do
+    obtener_info_sistema
+    clear
+    echo -e "${AZUL}╔═════════════════════════════════════════════════════════╗${FIN}"
+    echo -e "${AZUL}║${FIN}                 ${MAGENTA}⚡ MANAGER SSH SILK ⚡${FIN}                ${AZUL}║${FIN}"
+    echo -e "${AZUL}╚═════════════════════════════════════════════════════════╝${FIN}"
+    echo -e "${AZUL} 💎 SISTEMA:${FIN}"
+    echo -e "    🔹 OS: ${BLANCO}$OS${FIN}      🔹 Hora: ${BLANCO}$HORA${FIN}"
+    printf "    🔹 RAM: %-6s " "$RAM_TOTAL" ; echo -e "${AMARILLO}$(dibujar_barra $RAM_USO_PCT)${FIN}"
+    printf "    🔹 CPU: %-6s " "${NUCLEOS} nucleos" ; echo -e "${VERDE}$(dibujar_barra $CPU_USO_PCT)${FIN}"
+    echo -e "${AZUL} ---------------------------------------------------------${FIN}"
+    echo -e " 🟢 Online: ${VERDE}$ONLINE_USERS${FIN}     🔴 Vencidos: ${ROJO}$VENCIDOS${FIN}     👥 Total: ${CIAN}$TOTAL_USERS${FIN}"
+    echo -e "${AZUL} ═════════════════════════════════════════════════════════${FIN}"
+    echo -e "   ${CIAN}[01]${FIN} • Crear Usuario SSH      ${CIAN}[04]${FIN} • Configurar Cortafuegos"
+    echo -e "   ${CIAN}[02]${FIN} • Crear Cuenta de Test   ${CIAN}[05]${FIN} • Ver Usuarios del Sistema"
+    echo -e "   ${CIAN}[03]${FIN} • Eliminar Usuario SSH   ${CIAN}[06]${FIN} • Optimizar RAM"
+    echo -e "                             ${ROJO}[00]${FIN} • Salir del Menú"
+    echo -e "${AZUL} ═════════════════════════════════════════════════════════${FIN}"
+    read -p " 👉 Seleccione una opción: " opcion
+    
+    case $opcion in
+        1|01) crear_usuario ;;
+        2|02) crear_test ;;
+        3|03) eliminar_usuario ;;
+        4|04) abrir_puerto ;;
+        5|05) clear; echo -e "${CIAN}👥 Usuarios registrados en SSH SILK:${FIN}"; awk -F: '$3 >= 1000 && $1 != "nobody" {print " -> " $1}' /etc/passwd; echo; read -p "Enter para volver..." ;;
+        6|06) clear; echo -e "${VERDE}⚙️ SSH SILK: Optimizando RAM...${FIN}"; sync && echo 3 > /proc/sys/vm/drop_caches; sleep 1; echo -e "${VERDE}¡Memoria optimizada!${FIN}"; sleep 1 ;;
+        0|00) clear; echo -e "${VERDE}👋 Saliendo de SSH SILK... ¡Hasta pronto!${FIN}"; exit 0 ;;
+        *) echo -e "${ROJO}❌ Opción no válida.${FIN}"; sleep 1 ;;
+    esac
+done
