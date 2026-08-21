@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================
-# SCRIPT: SSH SILK - PREMIUM EDITION (CORREGIDO)
+# SCRIPT: SSH SILK - PREMIUM EDITION (FULL SYNTAX FIX)
 # COMPATIBLE CON: UBUNTU 20.04 / 22.04 / 24.04 Y DEBIAN
 # =========================================================
 
@@ -96,7 +96,7 @@ crear_test() {
     clear
     echo -e "${AMARILLO}⚡ SSH SILK - CREAR CUENTA TEST ${FIN}"
     USER_TEST="silk$(date +%s | tail -c 4)"
-    useradd -M -s /bin/false -e $(date -d "+1 day" +%Y-%m-%d) "$USER_TEST"
+    useradd -M -s /bin/false -e "$(date -d '+1 day' +%Y-%m-%d)" "$USER_TEST"
     echo "$USER_TEST:1234" | chpasswd
     echo -e "${VERDE}✅ Cuenta Creada de Prueba!${FIN}"
     echo -e "👤 Usuario: ${CIAN}$USER_TEST${FIN}"
@@ -162,31 +162,32 @@ gestionar_websocket() {
         fi
     else
         echo -e "Iniciando Proxy Python en Puerto 80 redirigido al SSH local (Puerto 22)..."
-        cat << 'EOF' > /tmp/ws80.py
-import socket, threading
-def proxy(c, a):
-    try:
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(('127.0.0.1', 22))
-        threading.Thread(target=forward, args=(c, s)).start()
-        forward(s, c)
-    except: pass
-def forward(src, dst):
-    try:
-        while True:
-            d = src.recv(4096)
-            if not d: break
-            dst.send(d)
-    except: pass
-    finally: src.close(); dst.close()
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('0.0.0.0', 80))
-srv.listen(100)
-while True:
-    c, a = srv.accept()
-    threading.Thread(target=proxy, args=(c, a)).start()
-EOF
+        
+        # Generar script de Python de forma segura evitando conflictos de Bash
+        echo "import socket, threading" > /tmp/ws80.py
+        echo "def proxy(c, a):" >> /tmp/ws80.py
+        echo "    try:" >> /tmp/ws80.py
+        echo "        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)" >> /tmp/ws80.py
+        echo "        s.connect(('127.0.0.1', 22))" >> /tmp/ws80.py
+        echo "        threading.Thread(target=forward, args=(c, s)).start()" >> /tmp/ws80.py
+        echo "        forward(s, c)" >> /tmp/ws80.py
+        echo "    except: pass" >> /tmp/ws80.py
+        echo "def forward(src, dst):" >> /tmp/ws80.py
+        echo "    try:" >> /tmp/ws80.py
+        echo "        while True:" >> /tmp/ws80.py
+        echo "            d = src.recv(4096)" >> /tmp/ws80.py
+        echo "            if not d: break" >> /tmp/ws80.py
+        echo "            dst.send(d)" >> /tmp/ws80.py
+        echo "    except: pass" >> /tmp/ws80.py
+        echo "    finally: src.close(); dst.close()" >> /tmp/ws80.py
+        echo "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)" >> /tmp/ws80.py
+        echo "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)" >> /tmp/ws80.py
+        echo "srv.bind(('0.0.0.0', 80))" >> /tmp/ws80.py
+        echo "srv.listen(100)" >> /tmp/ws80.py
+        echo "while True:" >> /tmp/ws80.py
+        echo "    c, a = srv.accept()" >> /tmp/ws80.py
+        echo "    threading.Thread(target=proxy, args=(c, a)).start()" >> /tmp/ws80.py
+
         ufw allow 80/tcp &>/dev/null
         screen -dmS ws_80 python3 /tmp/ws80.py
         echo -e "${VERDE}✅ WebSocket ejecutándose de fondo en puerto 80.${FIN}"
@@ -207,57 +208,22 @@ gestionar_websocket_security() {
         fi
     else
         echo -e "Configurando proxy Python con encabezado HTTP 101 Switching Protocols..."
-        cat << 'EOF' > /tmp/wss.py
-import socket, threading
-def proxy(c, a):
-    try:
-        req = c.recv(1024).decode('utf-8', errors='ignore')
-        if "Upgrade: websocket" in req:
-            c.send(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n")
-        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        s.connect(('127.0.0.1', 22))
-        threading.Thread(target=forward, args=(c, s)).start()
-        forward(s, c)
-    except: pass
-def forward(src, dst):
-    try:
-        while True:
-            d = src.recv(4096)
-            if not d: break
-            dst.send(d)
-    except: pass
-    finally: src.close(); dst.close()
-srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-srv.bind(('0.0.0.0', 80))
-srv.listen(100)
-while True:
-    c, a = srv.accept()
-    threading.Thread(target=proxy, args=(c, a)).start()
-EOF
-        screen -dmS wss_security python3 /tmp/wss.py
-
-        mkdir -p /etc/stunnel &>/dev/null
-        openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 -keyout /etc/stunnel/stunnel.pem -out /etc/stunnel/stunnel.pem -subj "/C=AR/ST=BA/L=Silk/O=SilkSSH/CN=SSH_SILK" &>/dev/null
         
-        cat << 'EOF' > /etc/stunnel/stunnel.conf
-pid = /var/run/stunnel4.pid
-cert = /etc/stunnel/stunnel.pem
-client = no
-[websocket_ssl]
-accept = 443
-connect = 127.0.0.1:80
-EOF
-        sed -i 's/ENABLED=0/ENABLED=1/g' /etc/default/stunnel4 2>/dev/null
-        ufw allow 80/tcp &>/dev/null
-        ufw allow 443/tcp &>/dev/null
-        systemctl restart stunnel4 &>/dev/null
-        echo -e "${VERDE}✅ WebSocket Security corriendo (Puerto 80 con payload 101 y SSL Cifrado en puerto 443).${FIN}"
-    fi
-    read -p "Presione Enter para continuar..."
-}
-
-gestionar_badvpn() {
-    clear
-    echo -e "${CIAN}⚡ SSH SILK - COMPONENTE BADVPN (UDP GATEWAY) ${FIN}"
-    if screen -list | grep -q "badvpn"; then
+        # Generar script de Python seguro línea por línea para evitar EOF roto
+        echo "import socket, threading" > /tmp/wss.py
+        echo "def proxy(c, a):" >> /tmp/wss.py
+        echo "    try:" >> /tmp/wss.py
+        echo "        req = c.recv(1024).decode('utf-8', errors='ignore')" >> /tmp/wss.py
+        echo "        if 'Upgrade: websocket' in req:" >> /tmp/wss.py
+        echo "            c.send(b'HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n\r\n')" >> /tmp/wss.py
+        echo "        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)" >> /tmp/wss.py
+        echo "        s.connect(('127.0.0.1', 22))" >> /tmp/wss.py
+        echo "        threading.Thread(target=forward, args=(c, s)).start()" >> /tmp/wss.py
+        echo "        forward(s, c)" >> /tmp/wss.py
+        echo "    except: pass" >> /tmp/wss.py
+        echo "def forward(src, dst):" >> /tmp/wss.py
+        echo "    try:" >> /tmp/wss.py
+        echo "        while True:" >> /tmp/wss.py
+        echo "            d = src.recv(4096)" >> /tmp/wss.py
+        echo "            if not d: break" >> /tmp/wss.py
+        echo "            dst.send(d)" >> /tmp/wss.py
