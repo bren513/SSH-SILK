@@ -1,131 +1,69 @@
 #!/bin/bash
 # ============================================================
-# SSH SILK MANAGER v4.0.0
-# Dropbear multi-puerto / WebSocket / WSS / BadVPN
-# Información del sistema / Diagnóstico / Actualización online
-# Ubuntu 20.04/22.04/24.04 - Debian 10/11/12+
+# SSH SILK MANAGER v5.0.0
+# Dropbear Multi-Puerto / WebSocket / WSS / BadVPN
+# Ubuntu 20.04/22.04/24.04 - Debian 11/12+
 # ============================================================
 
 set -o pipefail
 
-VERSION="4.0.0"
-GITHUB_RAW_URL="https://raw.githubusercontent.com/bren513/SSH-SILK/refs/heads/main/SSH%20SILK"
-
+VERSION="5.0.0"
+GITHUB_RAW="https://raw.githubusercontent.com/bren513/SSH-SILK/refs/heads/main/SSH%20SILK"
 BASE="/etc/silk"
 BIN="/usr/local/bin"
-INSTALL_PATH="$BIN/menu"
 SYSTEMD="/etc/systemd/system"
 
-WS_SCRIPT="$BASE/ws80.py"
-WS_TARGET_FILE="$BASE/ws.target"
 DROPBEAR_PORTS_FILE="$BASE/dropbear.ports"
 BADVPN_PORTS_FILE="$BASE/badvpn.ports"
+WS_PORT_FILE="$BASE/ws.port"
+WSS_PORT_FILE="$BASE/wss.port"
+WS_SCRIPT="$BASE/websocket.py"
+BADVPN_BIN="$BIN/badvpn-udpgw"
+
+VERDE="\e[1;32m"; ROJO="\e[1;31m"; AZUL="\e[1;34m"
+CIAN="\e[1;36m"; AMARILLO="\e[1;33m"; MAGENTA="\e[1;35m"
+BLANCO="\e[1;37m"; GRIS="\e[0;37m"; FIN="\e[0m"
+
+[[ $EUID -eq 0 ]] || { echo -e "${ROJO}❌ Ejecuta como root.${FIN}"; exit 1; }
 
 mkdir -p "$BASE"
 
-if [ "$EUID" -ne 0 ]; then
-    echo "❌ Ejecuta este script como root."
-    exit 1
-fi
+pausa() { read -r -p "Presiona Enter para continuar..."; }
 
-# ---------------- COLORES ----------------
-VERDE="\e[1;32m"
-ROJO="\e[1;31m"
-AZUL="\e[1;34m"
-CIAN="\e[1;36m"
-AMARILLO="\e[1;33m"
-MAGENTA="\e[1;35m"
-BLANCO="\e[1;37m"
-GRIS="\e[0;37m"
-FIN="\e[0m"
+validar_puerto() { [[ "$1" =~ ^[0-9]+$ ]] && ((10#$1 >= 1 && 10#$1 <= 65535)); }
 
-# ============================================================
-# UTILIDADES
-# ============================================================
-
-pause_menu() {
-    read -r -p "Presiona Enter para continuar..."
+normalizar_lista() {
+    tr ',;' '  ' <<< "$1" | tr -s '[:space:]' '\n' | sed '/^$/d' | sort -n -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'
 }
 
-valid_port() {
-    [[ "$1" =~ ^[0-9]+$ ]] && [ "$1" -ge 1 ] && [ "$1" -le 65535 ]
-}
-
-clean_ports() {
-    tr ' ' '\n' <<< "$1" | sed '/^$/d' | sort -n -u | tr '\n' ' ' | sed 's/[[:space:]]*$//'
-}
-
-validate_ports() {
+validar_lista_puertos() {
     local p
-    [ -n "$1" ] || return 1
+    [[ -n "$1" ]] || return 1
     for p in $1; do
-        if ! valid_port "$p"; then
-            echo -e "${ROJO}❌ Puerto inválido: $p${FIN}"
-            return 1
-        fi
+        validar_puerto "$p" || { echo -e "${ROJO}❌ Puerto inválido: $p${FIN}"; return 1; }
     done
-    return 0
 }
 
 tcp_listening() {
-    local p="$1"
-    ss -H -lnt 2>/dev/null | awk '{print $4}' |
-        grep -Eq "(^|:)${p}$|\\]:${p}$"
+    ss -H -lnt 2>/dev/null | awk '{print $4}' | grep -Eq "(^|:)${1}$|\\]:${1}$"
 }
 
 udp_listening() {
-    local p="$1"
-    ss -H -lnu 2>/dev/null | awk '{print $5}' |
-        grep -Eq "(^|:)${p}$|\\]:${p}$"
+    ss -H -lnu 2>/dev/null | awk '{print $5}' | grep -Eq "(^|:)${1}$|\\]:${1}$"
 }
 
 port_owner() {
-    local p="$1"
-    ss -lntup 2>/dev/null | grep -E "(:|\])${p}[[:space:]]" | head -n 3
+    ss -H -lntup 2>/dev/null | awk -v p="$1" '$5 ~ (":" p "$") || $5 ~ ("\\]:" p "$") {print $NF}' | head -1
 }
 
-tcp_owner_is_dropbear() {
-    local p="$1"
-    port_owner "$p" | grep -qi "dropbear"
-}
+fw_tcp_open() { command -v ufw >/dev/null 2>&1 && for p in "$@"; do ufw allow "$p/tcp" >/dev/null 2>&1 || true; done; }
+fw_udp_open() { command -v ufw >/dev/null 2>&1 && for p in "$@"; do ufw allow "$p/udp" >/dev/null 2>&1 || true; done; }
+fw_tcp_close() { command -v ufw >/dev/null 2>&1 && for p in "$@"; do ufw delete allow "$p/tcp" >/dev/null 2>&1 || true; done; }
+fw_udp_close() { command -v ufw >/dev/null 2>&1 && for p in "$@"; do ufw delete allow "$p/udp" >/dev/null 2>&1 || true; done; }
 
-tcp_owner_is_silk_ws() {
-    local p="$1"
-    port_owner "$p" | grep -Eqi "python|ws80"
-}
-
-open_tcp() {
+puertos_tcp_ui() {
     local p
-    for p in "$@"; do
-        command -v ufw >/dev/null 2>&1 && ufw allow "$p/tcp" >/dev/null 2>&1 || true
-    done
-}
-
-open_udp() {
-    local p
-    for p in "$@"; do
-        command -v ufw >/dev/null 2>&1 && ufw allow "$p/udp" >/dev/null 2>&1 || true
-    done
-}
-
-close_tcp() {
-    local p
-    for p in "$@"; do
-        command -v ufw >/dev/null 2>&1 && ufw delete allow "$p/tcp" >/dev/null 2>&1 || true
-    done
-}
-
-close_udp() {
-    local p
-    for p in "$@"; do
-        command -v ufw >/dev/null 2>&1 && ufw delete allow "$p/udp" >/dev/null 2>&1 || true
-    done
-}
-
-tcp_status_list() {
-    local list="$1" p
-    [ -n "$list" ] || { echo "  Ninguno"; return; }
-    for p in $list; do
+    for p in $1; do
         if tcp_listening "$p"; then
             echo -e "  ${VERDE}●${FIN} $p/tcp  ${VERDE}ON${FIN}"
         else
@@ -133,11 +71,9 @@ tcp_status_list() {
         fi
     done
 }
-
-udp_status_list() {
-    local list="$1" p
-    [ -n "$list" ] || { echo "  Ninguno"; return; }
-    for p in $list; do
+puertos_udp_ui() {
+    local p
+    for p in $1; do
         if udp_listening "$p"; then
             echo -e "  ${VERDE}●${FIN} $p/udp  ${VERDE}ON${FIN}"
         else
@@ -146,1213 +82,705 @@ udp_status_list() {
     done
 }
 
-service_on() {
-    systemctl is-active --quiet "$1" 2>/dev/null
-}
-
-# ============================================================
-# DEPENDENCIAS
-# ============================================================
-
-install_dependencies() {
-    echo -e "${CIAN}⚙ Verificando dependencias...${FIN}"
-
+instalar_dependencias() {
     export DEBIAN_FRONTEND=noninteractive
     apt-get update -y >/dev/null 2>&1 || true
-    apt-get install -y \
-        lsb-release ufw bc gawk host dropbear stunnel4 python3 \
-        wget curl openssl procps iproute2 >/dev/null 2>&1
-
-    local missing=0
-    for cmd in ss curl wget openssl python3 systemctl; do
-        command -v "$cmd" >/dev/null 2>&1 || {
-            echo -e "${ROJO}❌ Falta: $cmd${FIN}"
-            missing=1
-        }
-    done
-
-    command -v dropbear >/dev/null 2>&1 || {
-        echo -e "${ROJO}❌ Dropbear no está instalado.${FIN}"
-        missing=1
-    }
-
-    return "$missing"
+    apt-get install -y lsb-release ufw iproute2 procps gawk curl wget openssl python3 dropbear stunnel4 git cmake build-essential >/dev/null 2>&1
+    command -v ss >/dev/null 2>&1 || { echo -e "${ROJO}❌ Falta iproute2/ss.${FIN}"; return 1; }
+    command -v dropbear >/dev/null 2>&1 || { echo -e "${ROJO}❌ No se pudo instalar Dropbear.${FIN}"; return 1; }
 }
 
-# ============================================================
-# INSTALACIÓN PERSISTENTE / ALIAS
-# ============================================================
+# ---------------------- WEBSOCKET ----------------------
 
-install_alias() {
-    # Si se ejecutó como archivo normal, guardar copia.
-    if [ -f "$0" ] && [[ "$0" != /dev/fd/* ]] && [[ "$0" != /proc/* ]]; then
-        cp "$0" "$INSTALL_PATH" >/dev/null 2>&1 || true
-    fi
-
-    if [ ! -s "$INSTALL_PATH" ]; then
-        local tmp="/tmp/ssh_silk_bootstrap_$$.sh"
-        if curl -fLsS --connect-timeout 10 --max-time 60 "$GITHUB_RAW_URL" -o "$tmp" &&
-           [ -s "$tmp" ] && bash -n "$tmp" >/dev/null 2>&1 &&
-           grep -q "SSH SILK" "$tmp"; then
-            cp "$tmp" "$INSTALL_PATH"
-            chmod +x "$INSTALL_PATH"
-        fi
-        rm -f "$tmp"
-    fi
-
-    chmod +x "$INSTALL_PATH" 2>/dev/null || true
-
-    if ! grep -qF "alias menu='$INSTALL_PATH'" /root/.bashrc 2>/dev/null; then
-        echo "alias menu='$INSTALL_PATH'" >> /root/.bashrc
-    fi
-    if ! grep -qF "alias silk='$INSTALL_PATH'" /root/.bashrc 2>/dev/null; then
-        echo "alias silk='$INSTALL_PATH'" >> /root/.bashrc
-    fi
-}
-
-# ============================================================
-# DROPBEAR - IMPLEMENTACIÓN ROBUSTA
-# ============================================================
-
-dropbear_bin() {
-    if [ -x /usr/sbin/dropbear ]; then
-        echo /usr/sbin/dropbear
-    else
-        command -v dropbear 2>/dev/null || true
-    fi
-}
-
-ensure_dropbear_keys() {
-    local dir="/etc/dropbear"
-    mkdir -p "$dir"
-
-    if command -v dropbearkey >/dev/null 2>&1; then
-        if [ ! -s "$dir/dropbear_rsa_host_key" ]; then
-            dropbearkey -t rsa -f "$dir/dropbear_rsa_host_key" >/dev/null 2>&1 || true
-        fi
-        if [ ! -s "$dir/dropbear_ed25519_host_key" ]; then
-            dropbearkey -t ed25519 -f "$dir/dropbear_ed25519_host_key" >/dev/null 2>&1 || true
-        fi
-    fi
-}
-
-mask_native_dropbear() {
-    # Evita que el socket/servicio del paquete vuelva a levantar otro Dropbear.
-    systemctl disable --now dropbear.service >/dev/null 2>&1 || true
-    systemctl disable --now dropbear.socket >/dev/null 2>&1 || true
-    systemctl mask dropbear.service >/dev/null 2>&1 || true
-    systemctl mask dropbear.socket >/dev/null 2>&1 || true
-}
-
-unmask_native_dropbear() {
-    systemctl unmask dropbear.service >/dev/null 2>&1 || true
-    systemctl unmask dropbear.socket >/dev/null 2>&1 || true
-}
-
-stop_silk_dropbear() {
-    systemctl disable --now silk-dropbear.service >/dev/null 2>&1 || true
-    # Solo mata procesos Dropbear si existen; nunca mata sshd.
-    pkill -x dropbear >/dev/null 2>&1 || true
-    sleep 1
-}
-
-write_dropbear_service() {
-    local bin="$1"
-    local ports="$2"
-    local args="" p
-
-    for p in $ports; do
-        args+=" -p 0.0.0.0:${p}"
-    done
-
-    cat > "$BASE/dropbear-start.sh" <<EOF
-#!/bin/bash
-exec "$bin" -F -E$args
-EOF
-    chmod 700 "$BASE/dropbear-start.sh"
-
-    cat > "$SYSTEMD/silk-dropbear.service" <<EOF
-[Unit]
-Description=SSH SILK Dropbear Multi Port
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=$BASE/dropbear-start.sh
-Restart=on-failure
-RestartSec=2
-TimeoutStartSec=15
-TimeoutStopSec=10
-KillSignal=SIGTERM
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-EOF
-}
-
-manage_dropbear() {
-    clear
-    echo -e "${CIAN}⚡ SSH SILK • DROPBEAR MULTI-PUERTO${FIN}"
-    echo "============================================================"
-
-    local bin old ports p bad=0
-    bin="$(dropbear_bin)"
-
-    if [ -z "$bin" ]; then
-        echo -e "${ROJO}❌ Dropbear no está disponible.${FIN}"
-        pause_menu
-        return
-    fi
-
-    [ -f "$DROPBEAR_PORTS_FILE" ] && old="$(cat "$DROPBEAR_PORTS_FILE")"
-
-    echo -e "Estado: $(service_on silk-dropbear.service && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")"
-    echo -e "${CIAN}Puertos configurados:${FIN}"
-    tcp_status_list "$old"
-    echo
-    echo "Ejemplo: 2222 2200 8080"
-    read -r -p "🔌 Nuevos puertos: " ports
-    ports="$(clean_ports "$ports")"
-
-    if ! validate_ports "$ports"; then
-        pause_menu
-        return
-    fi
-
-    # Revisar conflictos ANTES de tocar el servicio actual.
-    for p in $ports; do
-        if tcp_listening "$p"; then
-            if tcp_owner_is_dropbear "$p"; then
-                continue
-            fi
-            echo -e "${ROJO}❌ Puerto $p/tcp ya está ocupado.${FIN}"
-            port_owner "$p"
-            bad=1
-        fi
-    done
-
-    if [ "$bad" -eq 1 ]; then
-        echo
-        echo -e "${AMARILLO}No se modificó la configuración actual.${FIN}"
-        pause_menu
-        return
-    fi
-
-    stop_silk_dropbear
-    mask_native_dropbear
-    ensure_dropbear_keys
-
-    write_dropbear_service "$bin" "$ports"
-    printf '%s\n' "$ports" > "$DROPBEAR_PORTS_FILE"
-
-    open_tcp $ports
-    systemctl daemon-reload
-    systemctl enable silk-dropbear.service >/dev/null 2>&1
-    systemctl restart silk-dropbear.service
-    sleep 2
-
-    bad=0
-    for p in $ports; do
-        tcp_listening "$p" || bad=1
-    done
-
-    echo
-    if [ "$bad" -eq 0 ]; then
-        echo -e "${VERDE}✅ Dropbear iniciado correctamente.${FIN}"
-        tcp_status_list "$ports"
-    else
-        echo -e "${ROJO}❌ Dropbear no pudo abrir uno o más puertos.${FIN}"
-        echo
-        echo "Servicio:"
-        systemctl status silk-dropbear.service --no-pager -l
-        echo
-        echo "Últimos errores:"
-        journalctl -u silk-dropbear.service -n 30 --no-pager
-        echo
-        echo -e "${AMARILLO}Prueba manual:${FIN}"
-        echo "$BASE/dropbear-start.sh"
-    fi
-
-    pause_menu
-}
-
-# ============================================================
-# WEBSOCKET HTTP - SIN PASTE/DEPENDENCIA EXTERNA
-# ============================================================
-
-write_websocket_python() {
-    cat > "$WS_SCRIPT" <<'PYEOF'
+crear_websocket_python() {
+    cat > "$WS_SCRIPT" <<'PY'
 #!/usr/bin/env python3
-import base64
-import hashlib
-import select
-import socket
-import struct
-import threading
-import time
-from socketserver import ThreadingMixIn, TCPServer, BaseRequestHandler
+import base64, hashlib, os, select, socket, struct, sys, threading
 
 LISTEN_HOST = "0.0.0.0"
-LISTEN_PORT = 80
-TARGET_HOST = "127.0.0.1"
-TARGET_PORT = 22
-BUFFER = 65536
+LISTEN_PORT = int(os.environ.get("SILK_WS_PORT", "80"))
+SSH_HOST = os.environ.get("SILK_SSH_HOST", "127.0.0.1")
+SSH_PORT = int(os.environ.get("SILK_SSH_PORT", "22"))
 
-def recv_exact(sock, n):
+def recv_headers(conn):
     data = b""
-    while len(data) < n:
-        part = sock.recv(n - len(data))
-        if not part:
-            return None
-        data += part
+    while b"\r\n\r\n" not in data and len(data) < 16384:
+        chunk = conn.recv(4096)
+        if not chunk: return b""
+        data += chunk
     return data
 
-def websocket_send(sock, payload, opcode=2):
-    first = 0x80 | (opcode & 0x0f)
-    length = len(payload)
-    if length < 126:
-        header = struct.pack("!BB", first, length)
-    elif length < 65536:
-        header = struct.pack("!BBH", first, 126, length)
-    else:
-        header = struct.pack("!BBQ", first, 127, length)
-    sock.sendall(header + payload)
+def tunnel(a, b):
+    sockets = [a, b]
+    try:
+        while True:
+            r, _, _ = select.select(sockets, [], [], 300)
+            if not r: break
+            for s in r:
+                other = b if s is a else a
+                data = s.recv(65535)
+                if not data: return
+                other.sendall(data)
+    except Exception:
+        pass
+    finally:
+        for s in sockets:
+            try: s.shutdown(socket.SHUT_RDWR)
+            except Exception: pass
+            try: s.close()
+            except Exception: pass
 
-def websocket_recv(sock):
-    head = recv_exact(sock, 2)
-    if not head:
-        return None, None
-    b1, b2 = head
-    opcode = b1 & 0x0f
-    masked = b2 & 0x80
-    length = b2 & 0x7f
-
-    if length == 126:
-        raw = recv_exact(sock, 2)
-        if not raw:
-            return None, None
-        length = struct.unpack("!H", raw)[0]
-    elif length == 127:
-        raw = recv_exact(sock, 8)
-        if not raw:
-            return None, None
-        length = struct.unpack("!Q", raw)[0]
-
-    if length > 16 * 1024 * 1024:
-        return None, None
-
-    mask = recv_exact(sock, 4) if masked else None
-    payload = recv_exact(sock, length)
-    if payload is None:
-        return None, None
-
-    if mask:
-        payload = bytes(payload[i] ^ mask[i % 4] for i in range(len(payload)))
-
-    return opcode, payload
-
-class WSHandler(BaseRequestHandler):
-    def handle(self):
-        client = self.request
-        client.settimeout(15)
-
-        try:
-            request = b""
-            while b"\r\n\r\n" not in request and len(request) < 65536:
-                chunk = client.recv(4096)
-                if not chunk:
-                    return
-                request += chunk
-
-            header_text = request.decode("latin1", "ignore")
-            lines = header_text.split("\r\n")
-            headers = {}
-            for line in lines[1:]:
-                if ":" in line:
-                    k, v = line.split(":", 1)
-                    headers[k.strip().lower()] = v.strip()
-
-            if "upgrade" not in headers.get("connection", "").lower() or \
-               headers.get("upgrade", "").lower() != "websocket" or \
-               "sec-websocket-key" not in headers:
-                client.sendall(
-                    b"HTTP/1.1 400 Bad Request\r\n"
-                    b"Connection: close\r\n"
-                    b"Content-Length: 0\r\n\r\n"
-                )
-                return
-
-            key = headers["sec-websocket-key"]
-            accept = base64.b64encode(
-                hashlib.sha1(
-                    (key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()
-                ).digest()
-            ).decode()
-
-            client.sendall(
-                b"HTTP/1.1 101 Switching Protocols\r\n"
-                b"Upgrade: websocket\r\n"
-                b"Connection: Upgrade\r\n"
-                + f"Sec-WebSocket-Accept: {accept}\r\n\r\n".encode()
-            )
-
-            client.settimeout(None)
-
-            target = socket.create_connection((TARGET_HOST, TARGET_PORT), timeout=10)
-            target.settimeout(None)
-
-            def client_to_target():
-                try:
-                    while True:
-                        opcode, payload = websocket_recv(client)
-                        if opcode is None:
-                            break
-                        if opcode == 8:
-                            break
-                        if opcode == 9:
-                            websocket_send(client, payload, 10)
-                            continue
-                        if opcode in (1, 2, 0):
-                            target.sendall(payload)
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        target.shutdown(socket.SHUT_WR)
-                    except Exception:
-                        pass
-
-            def target_to_client():
-                try:
-                    while True:
-                        data = target.recv(BUFFER)
-                        if not data:
-                            break
-                        websocket_send(client, data, 2)
-                except Exception:
-                    pass
-                finally:
-                    try:
-                        client.shutdown(socket.SHUT_WR)
-                    except Exception:
-                        pass
-
-            t1 = threading.Thread(target=client_to_target, daemon=True)
-            t2 = threading.Thread(target=target_to_client, daemon=True)
-            t1.start()
-            t2.start()
-            t1.join()
-            t2.join()
-
-            target.close()
-
-        except Exception:
+def websocket_accept(client):
+    req = recv_headers(client)
+    if not req: return
+    try:
+        text = req.decode("latin1", "ignore")
+        lines = text.split("\r\n")
+        if not lines or not lines[0].startswith(("GET ", "POST ", "CONNECT ")):
+            client.close(); return
+        headers = {}
+        for line in lines[1:]:
+            if ":" in line:
+                k, v = line.split(":", 1)
+                headers[k.strip().lower()] = v.strip()
+        key = headers.get("sec-websocket-key")
+        if not key:
+            client.sendall(b"HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n")
+            client.close(); return
+        accept = base64.b64encode(hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode()).digest()).decode()
+        client.sendall(("HTTP/1.1 101 Switching Protocols\r\n"
+                        "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                        f"Sec-WebSocket-Accept: {accept}\r\n\r\n").encode())
+        ssh = socket.create_connection((SSH_HOST, SSH_PORT), timeout=10)
+        # WebSocket frame -> raw SSH. Raw SSH -> binary WebSocket frames.
+        def ws_to_ssh():
             try:
-                client.close()
-            except Exception:
-                pass
+                while True:
+                    h = client.recv(2)
+                    if len(h) < 2: break
+                    b1, b2 = h
+                    masked = b2 & 0x80
+                    ln = b2 & 0x7f
+                    if ln == 126: ln = struct.unpack("!H", client.recv(2))[0]
+                    elif ln == 127: ln = struct.unpack("!Q", client.recv(8))[0]
+                    mask = client.recv(4) if masked else b""
+                    payload = bytearray()
+                    while len(payload) < ln:
+                        chunk = client.recv(min(65535, ln-len(payload)))
+                        if not chunk: return
+                        payload.extend(chunk)
+                    if masked:
+                        for i in range(ln): payload[i] ^= mask[i % 4]
+                    opcode = b1 & 0x0f
+                    if opcode == 0x8: return
+                    if opcode == 0x9:
+                        client.sendall(b"\x8a" + bytes([len(payload)]) + payload)
+                        continue
+                    if opcode in (1, 2, 0): ssh.sendall(payload)
+            except Exception: pass
+            finally:
+                try: ssh.shutdown(socket.SHUT_RDWR)
+                except Exception: pass
+        def ssh_to_ws():
+            try:
+                while True:
+                    data = ssh.recv(65535)
+                    if not data: break
+                    frame = b"\x82"
+                    if len(data) < 126: frame += bytes([len(data)])
+                    elif len(data) <= 65535: frame += b"\x7e" + struct.pack("!H", len(data))
+                    else: frame += b"\x7f" + struct.pack("!Q", len(data))
+                    client.sendall(frame + data)
+            except Exception: pass
+        t = threading.Thread(target=ws_to_ssh, daemon=True); t.start()
+        ssh_to_ws()
+    except Exception:
+        pass
+    finally:
+        try: client.close()
+        except Exception: pass
 
-class ThreadedTCPServer(ThreadingMixIn, TCPServer):
-    allow_reuse_address = True
-    daemon_threads = True
+def main():
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((LISTEN_HOST, LISTEN_PORT))
+    s.listen(256)
+    while True:
+        c, _ = s.accept()
+        threading.Thread(target=websocket_accept, args=(c,), daemon=True).start()
 
 if __name__ == "__main__":
-    with ThreadedTCPServer((LISTEN_HOST, LISTEN_PORT), WSHandler) as server:
-        print("SSH SILK WebSocket listening on 0.0.0.0:80 -> 127.0.0.1:22", flush=True)
-        server.serve_forever()
-PYEOF
-
-    chmod 755 "$WS_SCRIPT"
-    printf '22\n' > "$WS_TARGET_FILE"
+    main()
+PY
+    chmod 700 "$WS_SCRIPT"
+    python3 -m py_compile "$WS_SCRIPT"
 }
 
-write_ws_service() {
+crear_ws_service() {
     cat > "$SYSTEMD/silk-websocket.service" <<EOF
 [Unit]
 Description=SSH SILK WebSocket HTTP
-After=network-online.target
-Wants=network-online.target
-
+After=network.target
 [Service]
 Type=simple
+Environment=SILK_WS_PORT=80
+Environment=SILK_SSH_HOST=127.0.0.1
+Environment=SILK_SSH_PORT=22
 ExecStart=/usr/bin/python3 $WS_SCRIPT
-Restart=on-failure
+Restart=always
 RestartSec=2
-TimeoutStartSec=15
-StandardOutput=journal
-StandardError=journal
-
 [Install]
 WantedBy=multi-user.target
 EOF
 }
 
-manage_websocket() {
+gestionar_websocket() {
     clear
-    echo -e "${CIAN}⚡ SSH SILK • WEBSOCKET HTTP :80${FIN}"
+    echo -e "${CIAN}⚡ SSH SILK • WEBSOCKET HTTP${FIN}"
     echo "============================================================"
-
+    echo -e "Puerto: ${BLANCO}80/tcp${FIN}"
     if tcp_listening 80; then
-        echo -e "Estado real: ${VERDE}ON${FIN}"
-        port_owner 80
-        echo
-        read -r -p "¿Deseas detener WebSocket? (s/n): " opt
-        if [[ "$opt" == "s" || "$opt" == "S" ]]; then
+        echo -e "Estado: ${VERDE}● ON${FIN}"
+        read -r -p "¿Detener puerto 80? (s/n): " r
+        if [[ "$r" =~ ^[sS]$ ]]; then
             systemctl disable --now silk-websocket.service >/dev/null 2>&1 || true
-            sleep 1
-            if tcp_listening 80; then
-                echo -e "${ROJO}❌ 80 sigue ocupado.${FIN}"
-                port_owner 80
-            else
-                echo -e "${VERDE}✅ WebSocket detenido.${FIN}"
-            fi
+            fw_tcp_close 80
+            echo -e "${VERDE}✅ Puerto 80 detenido.${FIN}"
         fi
-        pause_menu
-        return
-    fi
-
-    if tcp_listening 80; then
-        echo -e "${ROJO}❌ Puerto 80 ocupado.${FIN}"
-        port_owner 80
-        pause_menu
-        return
-    fi
-
-    echo -e "Estado real: ${ROJO}OFF${FIN}"
-    echo "Instalando WebSocket integrado..."
-
-    write_websocket_python
-    open_tcp 80
-    write_ws_service
-
-    systemctl daemon-reload
-    systemctl enable silk-websocket.service >/dev/null 2>&1
-    systemctl restart silk-websocket.service
-    sleep 2
-
-    if tcp_listening 80; then
-        echo -e "${VERDE}✅ WebSocket HTTP activo en 80.${FIN}"
-        echo "Destino SSH interno: 127.0.0.1:22"
     else
-        echo -e "${ROJO}❌ WebSocket no abrió el puerto 80.${FIN}"
-        journalctl -u silk-websocket.service -n 30 --no-pager
+        echo -e "Estado: ${ROJO}● OFF${FIN}"
+        if tcp_listening 80; then
+            echo -e "${ROJO}❌ Ocupado por: $(port_owner 80)${FIN}"; pausa; return
+        fi
+        crear_websocket_python || { echo -e "${ROJO}❌ Error validando WebSocket.${FIN}"; pausa; return; }
+        crear_ws_service
+        systemctl daemon-reload
+        fw_tcp_open 80
+        systemctl enable --now silk-websocket.service >/dev/null 2>&1
+        sleep 2
+        if tcp_listening 80; then echo -e "${VERDE}✅ WebSocket activo en 80.${FIN}"
+        else echo -e "${ROJO}❌ No abrió 80.${FIN}"; journalctl -u silk-websocket.service -n 20 --no-pager; fi
     fi
-
-    pause_menu
+    pausa
 }
 
-# ============================================================
-# WSS / SECURITY
-# ============================================================
+# ---------------------- WSS ----------------------
 
-create_ssl_cert() {
+crear_certificado() {
     mkdir -p /etc/stunnel
-
-    if [ ! -s /etc/stunnel/stunnel.pem ]; then
-        openssl req -new -newkey rsa:2048 -days 365 -nodes -x509 \
-            -keyout /etc/stunnel/stunnel.pem \
-            -out /etc/stunnel/stunnel.pem \
-            -subj "/C=AR/ST=BA/L=Silk/O=SilkSSH/CN=SSH_SILK" >/dev/null 2>&1
+    if [[ ! -s /etc/stunnel/stunnel.pem ]]; then
+        openssl req -x509 -newkey rsa:2048 -nodes -days 825 \
+          -keyout /etc/stunnel/stunnel.pem -out /etc/stunnel/stunnel.pem \
+          -subj "/C=AR/ST=BA/L=Silk/O=SSH-SILK/CN=SSH-SILK" >/dev/null 2>&1 || return 1
+        chmod 600 /etc/stunnel/stunnel.pem
     fi
-
-    chmod 600 /etc/stunnel/stunnel.pem
 }
 
-configure_stunnel() {
+configurar_stunnel() {
     cat > /etc/stunnel/stunnel.conf <<EOF
 pid = /run/stunnel4.pid
 cert = /etc/stunnel/stunnel.pem
 client = no
 foreground = no
-
-[websocket_ssl]
+[ssh_silk_wss]
 accept = 443
 connect = 127.0.0.1:80
 EOF
-
-    if [ -f /etc/default/stunnel4 ]; then
-        if grep -q '^ENABLED=' /etc/default/stunnel4; then
-            sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4
-        else
-            echo "ENABLED=1" >> /etc/default/stunnel4
-        fi
+    if [[ -f /etc/default/stunnel4 ]]; then
+        if grep -q '^ENABLED=' /etc/default/stunnel4; then sed -i 's/^ENABLED=.*/ENABLED=1/' /etc/default/stunnel4
+        else echo "ENABLED=1" >> /etc/default/stunnel4; fi
     fi
 }
 
-manage_wss() {
+gestionar_wss() {
     clear
-    echo -e "${CIAN}⚡ SSH SILK • WEBSOCKET SECURITY :443${FIN}"
+    echo -e "${CIAN}⚡ SSH SILK • WEBSOCKET SECURITY${FIN}"
     echo "============================================================"
-
+    echo -e "Puerto SSL: ${BLANCO}443/tcp${FIN}"
     if tcp_listening 443; then
-        echo -e "Estado real: ${VERDE}ON${FIN}"
-        port_owner 443
-        echo
-        read -r -p "¿Deseas detener WSS? (s/n): " opt
-        if [[ "$opt" == "s" || "$opt" == "S" ]]; then
+        echo -e "Estado: ${VERDE}● ON${FIN}"
+        read -r -p "¿Detener puerto 443? (s/n): " r
+        if [[ "$r" =~ ^[sS]$ ]]; then
             systemctl disable --now stunnel4 >/dev/null 2>&1 || true
-            sleep 1
-            echo -e "${VERDE}✅ WSS detenido.${FIN}"
+            fw_tcp_close 443
+            echo -e "${VERDE}✅ Puerto 443 detenido.${FIN}"
         fi
-        pause_menu
-        return
+        pausa; return
     fi
-
-    if tcp_listening 443; then
-        echo -e "${ROJO}❌ Puerto 443 ocupado.${FIN}"
-        port_owner 443
-        pause_menu
-        return
-    fi
-
-    # 443 depende de 80.
+    if tcp_listening 443; then echo -e "${ROJO}❌ Ocupado por: $(port_owner 443)${FIN}"; pausa; return; fi
     if ! tcp_listening 80; then
-        echo "WebSocket HTTP no está activo."
-        echo "Se iniciará automáticamente..."
-        write_websocket_python
-        open_tcp 80
-        write_ws_service
-        systemctl daemon-reload
+        echo "WebSocket 80 está OFF. Se activará porque WSS depende de él."
+        crear_websocket_python || { echo -e "${ROJO}❌ No se pudo preparar WebSocket.${FIN}"; pausa; return; }
+        crear_ws_service; systemctl daemon-reload; fw_tcp_open 80
         systemctl enable --now silk-websocket.service >/dev/null 2>&1
         sleep 2
+        if ! tcp_listening 80; then echo -e "${ROJO}❌ WebSocket 80 no inició.${FIN}"; journalctl -u silk-websocket.service -n 20 --no-pager; pausa; return; fi
     fi
-
-    if ! tcp_listening 80; then
-        echo -e "${ROJO}❌ No se pudo iniciar WebSocket en 80.${FIN}"
-        journalctl -u silk-websocket.service -n 30 --no-pager
-        pause_menu
-        return
-    fi
-
-    create_ssl_cert
-    configure_stunnel
-    open_tcp 443
-
+    crear_certificado || { echo -e "${ROJO}❌ No se pudo crear certificado.${FIN}"; pausa; return; }
+    configurar_stunnel
+    fw_tcp_open 443
     systemctl daemon-reload
-    systemctl enable stunnel4 >/dev/null 2>&1
-    systemctl restart stunnel4
+    systemctl enable --now stunnel4 >/dev/null 2>&1
     sleep 2
-
-    if tcp_listening 443; then
-        echo -e "${VERDE}✅ WSS activo en 443.${FIN}"
-        echo "443 SSL → 80 WebSocket → SSH 22"
-    else
-        echo -e "${ROJO}❌ Stunnel no abrió 443.${FIN}"
-        systemctl status stunnel4 --no-pager -l
-        journalctl -u stunnel4 -n 30 --no-pager
-    fi
-
-    pause_menu
+    if tcp_listening 443; then echo -e "${VERDE}✅ WSS activo: 443 → SSL → 80 → SSH.${FIN}"
+    else echo -e "${ROJO}❌ WSS no abrió 443.${FIN}"; journalctl -u stunnel4 -n 20 --no-pager; fi
+    pausa
 }
 
-# ============================================================
-# BADVPN MULTI-PUERTO
-# ============================================================
+# ---------------------- DROPBEAR ----------------------
 
-download_badvpn() {
-    if [ -x "$BIN/badvpn-udpgw" ]; then
-        return 0
-    fi
-
-    echo "Descargando BadVPN..."
-    curl -fL --connect-timeout 10 --max-time 60 \
-        -o "$BIN/badvpn-udpgw" \
-        "https://github.com/ambrop72/badvpn/raw/master/output/badvpn-udpgw" >/dev/null 2>&1 || true
-
-    if [ ! -s "$BIN/badvpn-udpgw" ]; then
-        curl -fL --connect-timeout 10 --max-time 60 \
-            -o "$BIN/badvpn-udpgw" \
-            "https://raw.githubusercontent.com/serverfree/badvpn/master/badvpn-udpgw" >/dev/null 2>&1 || true
-    fi
-
-    chmod +x "$BIN/badvpn-udpgw" 2>/dev/null || true
-    [ -x "$BIN/badvpn-udpgw" ]
+crear_dropbear_wrapper() {
+    local ports="$1" bin="$2"
+    {
+        echo '#!/bin/bash'
+        echo 'exec "'"$bin"'" -F -E -R \'
+        local p
+        for p in $ports; do printf '  -p 0.0.0.0:%s \\\n' "$p"; done
+        echo
+    } > "$BASE/dropbear-start.sh"
+    chmod 700 "$BASE/dropbear-start.sh"
 }
 
-write_badvpn_template() {
-    cat > "$SYSTEMD/silk-badvpn@.service" <<'EOF'
+crear_dropbear_service() {
+    cat > "$SYSTEMD/silk-dropbear.service" <<EOF
 [Unit]
-Description=SSH SILK BadVPN UDPGW %i
-After=network-online.target
-Wants=network-online.target
-
+Description=SSH SILK Dropbear Multi Port
+After=network.target
+Conflicts=dropbear.service dropbear.socket
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/badvpn-udpgw --listen-addr 0.0.0.0:%i --max-clients 1000 --max-connections-for-client 10
+ExecStart=$BASE/dropbear-start.sh
 Restart=on-failure
 RestartSec=2
-TimeoutStartSec=15
-StandardOutput=journal
-StandardError=journal
-
 [Install]
 WantedBy=multi-user.target
 EOF
 }
 
-stop_badvpn_ports() {
-    local list="$1" p
-    for p in $list; do
-        systemctl disable --now "silk-badvpn@${p}.service" >/dev/null 2>&1 || true
-    done
+detener_dropbear_puerto() {
+    local actual="$1"
+    [[ -n "$actual" ]] || { echo "No hay puertos configurados."; return; }
+    echo "Puertos actuales: $actual"
+    read -r -p "Puerto a detener (o ALL): " p
+    if [[ "$p" =~ ^[Aa][Ll][Ll]$ ]]; then
+        systemctl disable --now silk-dropbear.service >/dev/null 2>&1 || true
+        fw_tcp_close $actual
+        : > "$DROPBEAR_PORTS_FILE"
+        echo -e "${VERDE}✅ Todos los puertos Dropbear detenidos.${FIN}"
+        return
+    fi
+    validar_puerto "$p" || { echo -e "${ROJO}❌ Puerto inválido.${FIN}"; return; }
+    grep -qw "$p" <<< "$actual" || { echo -e "${ROJO}❌ Ese puerto no está configurado.${FIN}"; return; }
+    local nuevos
+    nuevos="$(tr ' ' '\n' <<< "$actual" | grep -vx "$p" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    if [[ -z "$nuevos" ]]; then
+        systemctl disable --now silk-dropbear.service >/dev/null 2>&1 || true
+        : > "$DROPBEAR_PORTS_FILE"
+    else
+        local bin; bin="$(command -v dropbear)"
+        crear_dropbear_wrapper "$nuevos" "$bin"
+        echo "$nuevos" > "$DROPBEAR_PORTS_FILE"
+        systemctl restart silk-dropbear.service
+    fi
+    fw_tcp_close "$p"
+    echo -e "${VERDE}✅ Puerto $p detenido.${FIN}"
 }
 
-manage_badvpn() {
+gestionar_dropbear() {
+    clear
+    echo -e "${CIAN}⚡ SSH SILK • DROPBEAR MULTI-PUERTO${FIN}"
+    echo "============================================================"
+    local actual=""; [[ -f "$DROPBEAR_PORTS_FILE" ]] && actual="$(cat "$DROPBEAR_PORTS_FILE")"
+    echo -e "Estado: $(systemctl is-active --quiet silk-dropbear.service && echo -e "${VERDE}● ON${FIN}" || echo -e "${ROJO}● OFF${FIN}")"
+    echo -e "Configurados: ${BLANCO}${actual:-Ninguno}${FIN}"
+    [[ -n "$actual" ]] && puertos_tcp_ui "$actual"
+    echo
+    echo "[1] Configurar/reconfigurar puertos"
+    echo "[2] Detener un puerto"
+    echo "[0] Volver"
+    read -r -p "Opción: " op
+    case "$op" in
+      2) detener_dropbear_puerto "$actual"; pausa; return ;;
+      1) ;;
+      *) return ;;
+    esac
+    echo "Ejemplo: 2222 2200 8080"
+    read -r -p "Puertos Dropbear: " nuevos
+    nuevos="$(normalizar_lista "$nuevos")"
+    validar_lista_puertos "$nuevos" || { pausa; return; }
+    local p bin
+    for p in $nuevos; do
+        if tcp_listening "$p" && ! grep -qw "$p" <<< "$actual"; then
+            echo -e "${ROJO}❌ $p/tcp ya está ocupado: $(port_owner "$p")${FIN}"
+            pausa; return
+        fi
+    done
+    bin="$(command -v dropbear)"
+    systemctl disable --now dropbear.service dropbear.socket >/dev/null 2>&1 || true
+    crear_dropbear_wrapper "$nuevos" "$bin"
+    crear_dropbear_service
+    echo "$nuevos" > "$DROPBEAR_PORTS_FILE"
+    fw_tcp_open $nuevos
+    systemctl daemon-reload
+    systemctl enable --now silk-dropbear.service >/dev/null 2>&1
+    sleep 2
+    if systemctl is-active --quiet silk-dropbear.service && todos_tcp_activos "$nuevos"; then
+        echo -e "${VERDE}✅ Dropbear activo.${FIN}"; puertos_tcp_ui "$nuevos"
+    else
+        echo -e "${ROJO}❌ Dropbear no inició correctamente.${FIN}"
+        journalctl -u silk-dropbear.service -n 30 --no-pager
+    fi
+    pausa
+}
+
+# ---------------------- BADVPN ----------------------
+
+compilar_badvpn() {
+    if [[ -x "$BADVPN_BIN" ]] && "$BADVPN_BIN" --help >/dev/null 2>&1; then return 0; fi
+    local src="$BASE/badvpn-src" build="$BASE/badvpn-build"
+    rm -rf "$src" "$build"
+    echo "Descargando código fuente oficial de BadVPN..."
+    if ! git clone --depth 1 https://github.com/ambrop72/badvpn.git "$src" >/dev/null 2>&1; then
+        echo -e "${ROJO}❌ No se pudo descargar BadVPN.${FIN}"; return 1
+    fi
+    cmake -S "$src" -B "$build" -DBUILD_NOTHING_BY_DEFAULT=1 -DBUILD_UDPGW=1 >/dev/null 2>&1 || return 1
+    cmake --build "$build" -j"$(nproc)" >/dev/null 2>&1 || return 1
+    local found; found="$(find "$build" -type f -name badvpn-udpgw -perm -111 | head -1)"
+    [[ -n "$found" ]] || { echo -e "${ROJO}❌ No se encontró el binario compilado.${FIN}"; return 1; }
+    install -m 755 "$found" "$BADVPN_BIN"
+    "$BADVPN_BIN" --help >/dev/null 2>&1
+}
+
+crear_badvpn_service() {
+    local ports="$1"
+    {
+        echo "[Unit]"
+        echo "Description=SSH SILK BadVPN UDP Gateway"
+        echo "After=network.target"
+        echo "[Service]"
+        echo "Type=simple"
+        echo -n "ExecStart=$BADVPN_BIN"
+        local p
+        for p in $ports; do echo -n " --listen-addr 0.0.0.0:$p"; done
+        echo " --max-clients 1000 --max-connections-for-client 10"
+        echo "Restart=on-failure"
+        echo "RestartSec=2"
+        echo "[Install]"
+        echo "WantedBy=multi-user.target"
+    } > "$SYSTEMD/silk-badvpn.service"
+}
+
+detener_badvpn_puerto() {
+    local actual="$1"
+    [[ -n "$actual" ]] || { echo "No hay puertos configurados."; return; }
+    echo "Puertos actuales: $actual"
+    read -r -p "Puerto UDP a detener (o ALL): " p
+    if [[ "$p" =~ ^[Aa][Ll][Ll]$ ]]; then
+        systemctl disable --now silk-badvpn.service >/dev/null 2>&1 || true
+        fw_udp_close $actual
+        : > "$BADVPN_PORTS_FILE"
+        echo -e "${VERDE}✅ Todos los puertos BadVPN detenidos.${FIN}"; return
+    fi
+    validar_puerto "$p" || { echo -e "${ROJO}❌ Puerto inválido.${FIN}"; return; }
+    grep -qw "$p" <<< "$actual" || { echo -e "${ROJO}❌ Ese puerto no está configurado.${FIN}"; return; }
+    local nuevos
+    nuevos="$(tr ' ' '\n' <<< "$actual" | grep -vx "$p" | tr '\n' ' ' | sed 's/[[:space:]]*$//')"
+    if [[ -z "$nuevos" ]]; then
+        systemctl disable --now silk-badvpn.service >/dev/null 2>&1 || true
+        : > "$BADVPN_PORTS_FILE"
+    else
+        crear_badvpn_service "$nuevos"
+        echo "$nuevos" > "$BADVPN_PORTS_FILE"
+        systemctl daemon-reload
+        systemctl restart silk-badvpn.service
+    fi
+    fw_udp_close "$p"
+    echo -e "${VERDE}✅ Puerto UDP $p detenido.${FIN}"
+}
+
+gestionar_badvpn() {
     clear
     echo -e "${CIAN}⚡ SSH SILK • BADVPN MULTI-PUERTO${FIN}"
     echo "============================================================"
-
-    local old="" ports p bad=0
-    [ -f "$BADVPN_PORTS_FILE" ] && old="$(cat "$BADVPN_PORTS_FILE")"
-
-    echo -e "${CIAN}Puertos actuales:${FIN}"
-    udp_status_list "$old"
+    local actual=""; [[ -f "$BADVPN_PORTS_FILE" ]] && actual="$(cat "$BADVPN_PORTS_FILE")"
+    echo -e "Estado: $(systemctl is-active --quiet silk-badvpn.service && echo -e "${VERDE}● ON${FIN}" || echo -e "${ROJO}● OFF${FIN}")"
+    echo -e "Configurados: ${BLANCO}${actual:-Ninguno}${FIN}"
+    [[ -n "$actual" ]] && puertos_udp_ui "$actual"
     echo
+    echo "[1] Configurar/reconfigurar puertos"
+    echo "[2] Detener un puerto"
+    echo "[0] Volver"
+    read -r -p "Opción: " op
+    case "$op" in
+      2) detener_badvpn_puerto "$actual"; pausa; return ;;
+      1) ;;
+      *) return ;;
+    esac
     echo "Ejemplo: 7300 7301 7302 7303"
-    read -r -p "🔌 Nuevos puertos UDP: " ports
-    ports="$(clean_ports "$ports")"
-
-    if ! validate_ports "$ports"; then
-        pause_menu
-        return
-    fi
-
-    if ! download_badvpn; then
-        echo -e "${ROJO}❌ No se pudo descargar BadVPN.${FIN}"
-        pause_menu
-        return
-    fi
-
-    # Revisar conflictos antes de detener los puertos actuales.
-    for p in $ports; do
-        if udp_listening "$p" && ! port_owner "$p" | grep -qi "badvpn"; then
-            echo -e "${ROJO}❌ Puerto UDP $p ya está ocupado.${FIN}"
-            port_owner "$p"
-            bad=1
+    read -r -p "Puertos BadVPN UDP: " nuevos
+    nuevos="$(normalizar_lista "$nuevos")"
+    validar_lista_puertos "$nuevos" || { pausa; return; }
+    local p
+    for p in $nuevos; do
+        if udp_listening "$p" && ! grep -qw "$p" <<< "$actual"; then
+            echo -e "${ROJO}❌ $p/udp ya está ocupado: $(port_owner "$p")${FIN}"; pausa; return
         fi
     done
-
-    if [ "$bad" -eq 1 ]; then
-        pause_menu
-        return
-    fi
-
-    stop_badvpn_ports "$old"
-    write_badvpn_template
-    printf '%s\n' "$ports" > "$BADVPN_PORTS_FILE"
+    compilar_badvpn || { echo -e "${ROJO}❌ No se pudo instalar/compilar BadVPN.${FIN}"; pausa; return; }
+    systemctl disable --now badvpn.service badvpn-udpgw.service >/dev/null 2>&1 || true
+    crear_badvpn_service "$nuevos"
+    echo "$nuevos" > "$BADVPN_PORTS_FILE"
+    fw_udp_open $nuevos
     systemctl daemon-reload
-    open_udp $ports
-
-    for p in $ports; do
-        systemctl enable --now "silk-badvpn@${p}.service" >/dev/null 2>&1
-    done
-
+    systemctl enable --now silk-badvpn.service >/dev/null 2>&1
     sleep 2
-
-    echo
-    udp_status_list "$ports"
-
-    for p in $ports; do
-        if ! udp_listening "$p"; then
-            echo -e "${ROJO}⚠ Error en UDP $p:${FIN}"
-            journalctl -u "silk-badvpn@${p}.service" -n 15 --no-pager
-        fi
-    done
-
-    pause_menu
-}
-
-# ============================================================
-# USUARIOS
-# ============================================================
-
-create_user() {
-    clear
-    echo -e "${CIAN}⚡ CREAR USUARIO SSH${FIN}"
-    read -r -p "👤 Usuario: " user
-
-    if id "$user" >/dev/null 2>&1; then
-        echo -e "${ROJO}❌ El usuario ya existe.${FIN}"
-        pause_menu
-        return
-    fi
-
-    read -r -s -p "🔑 Contraseña: " pass
-    echo
-    read -r -p "⏳ Días de duración: " days
-
-    if ! [[ "$days" =~ ^[0-9]+$ ]] || [ "$days" -lt 1 ]; then
-        echo -e "${ROJO}❌ Días inválidos.${FIN}"
-        pause_menu
-        return
-    fi
-
-    local exp
-    exp="$(date -d "+$days days" +%Y-%m-%d)"
-    useradd -M -s /bin/false -e "$exp" "$user"
-    echo "$user:$pass" | chpasswd
-
-    echo -e "${VERDE}✅ Usuario creado.${FIN}"
-    echo "Usuario : $user"
-    echo "Expira  : $exp"
-    pause_menu
-}
-
-create_test() {
-    clear
-    local user="silk$(date +%s | tail -c 6)"
-    useradd -M -s /bin/false -e "$(date -d '+1 day' +%Y-%m-%d)" "$user"
-    echo "$user:1234" | chpasswd
-
-    echo -e "${VERDE}✅ Cuenta TEST creada.${FIN}"
-    echo "Usuario: $user"
-    echo "Pass: 1234"
-    echo "Expira: 24 horas"
-    pause_menu
-}
-
-list_users() {
-    clear
-    echo -e "${CIAN}👥 USUARIOS SSH${FIN}"
-    echo "============================================================"
-    awk -F: '$3 >= 1000 && $1 != "nobody" {print " • " $1}' /etc/passwd
-    echo "============================================================"
-    pause_menu
-}
-
-delete_user() {
-    clear
-    read -r -p "👤 Usuario a eliminar: " user
-
-    if id "$user" >/dev/null 2>&1; then
-        userdel -f "$user" >/dev/null 2>&1
-        echo -e "${VERDE}✅ Usuario eliminado.${FIN}"
+    if systemctl is-active --quiet silk-badvpn.service && todos_udp_activos "$nuevos"; then
+        echo -e "${VERDE}✅ BadVPN activo.${FIN}"; puertos_udp_ui "$nuevos"
     else
-        echo -e "${ROJO}❌ Usuario inexistente.${FIN}"
+        echo -e "${ROJO}❌ BadVPN no abrió uno o más puertos.${FIN}"
+        journalctl -u silk-badvpn.service -n 30 --no-pager
     fi
-    pause_menu
+    pausa
 }
 
-get_total_users() {
-    awk -F: '$3 >= 1000 && $1 != "nobody" {n++} END{print n+0}' /etc/passwd
+# ---------------------- INFO SISTEMA ----------------------
+
+cpu_usage() {
+    local idle; idle="$(top -bn1 | awk -F'[, ]+' '/Cpu\(s\)/ {for(i=1;i<=NF;i++) if($i ~ /id/) {gsub(/%/,"",$(i-1)); print $(i-1); exit}}')"
+    [[ "$idle" =~ ^[0-9.]+$ ]] && awk -v i="$idle" 'BEGIN {printf "%d", 100-i}' || echo 0
 }
+ram_usage_pct() { free | awk '/Mem:/ {if($2) printf "%d", ($3/$2)*100; else print 0}'; }
+disk_usage() { df -hP / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}'; }
 
-get_expired_users() {
-    local n=0 now
-    now="$(date +%s)"
-    while IFS=: read -r user _ _ _ _ _ _ expire _; do
-        [ -z "$expire" ] && continue
-        if [[ "$expire" =~ ^[0-9]+$ ]] && [ "$expire" -gt 0 ]; then
-            local expdate
-            expdate="$(date -d "1970-01-01 +$((expire-1)) days" +%s 2>/dev/null || echo 0)"
-            [ "$expdate" -lt "$now" ] && n=$((n+1))
-        fi
-    done < /etc/shadow 2>/dev/null
-    echo "$n"
-}
-
-get_ssh_connections() {
-    ss -H -tn state established 2>/dev/null |
-        awk '{print $4}' |
-        grep -Ev ':(22|80|443)$' >/dev/null 2>&1 || true
-    ss -H -tn state established 2>/dev/null | wc -l
-}
-
-# ============================================================
-# INFORMACIÓN DEL SISTEMA
-# ============================================================
-
-cpu_percent() {
-    local a b idle1 idle2 total1 total2 idle_diff total_diff
-    read -r _ a _ _ _ _ _ _ _ < <(grep '^cpu ' /proc/stat)
-    # Método corto y estable usando /proc/loadavg para no bloquear.
-    local cores load
-    cores="$(nproc)"
-    load="$(awk '{print $1}' /proc/loadavg)"
-    awk -v l="$load" -v c="$cores" 'BEGIN {
-        p=(l/c)*100;
-        if(p>100)p=100;
-        printf "%d", p
-    }'
-}
-
-ram_percent() {
-    free | awk '/Mem:/ {if($2>0) printf "%d", ($3/$2)*100; else print 0}'
-}
-
-disk_info() {
-    df -hP / | awk 'NR==2 {print $3 "/" $2 " (" $5 ")"}'
-}
-
-uptime_human() {
-    uptime -p 2>/dev/null | sed 's/^up //'
-}
-
-system_info() {
+info_sistema() {
     clear
-
-    local os kernel arch uptime_s ram_total ram_used ram_pct disk ip cpu load cores
-    os="$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
-    kernel="$(uname -r)"
-    arch="$(uname -m)"
-    uptime_s="$(uptime_human)"
+    local os kernel arch ip uptime_s ram_total ram_used ram_pct cpu disk
+    os="$(lsb_release -ds 2>/dev/null || sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
+    kernel="$(uname -r)"; arch="$(uname -m)"
+    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
+    uptime_s="$(uptime -p 2>/dev/null || true)"
     ram_total="$(free -h | awk '/Mem:/ {print $2}')"
     ram_used="$(free -h | awk '/Mem:/ {print $3}')"
-    ram_pct="$(ram_percent)"
-    disk="$(disk_info)"
-    ip="$(hostname -I 2>/dev/null | awk '{print $1}')"
-    cores="$(nproc)"
-    load="$(awk '{print $1" "$2" "$3}' /proc/loadavg)"
-    cpu="$(cpu_percent)"
-
-    echo -e "${CIAN}⚡ SSH SILK • INFORMACIÓN DEL SISTEMA${FIN}"
-    echo "============================================================"
+    ram_pct="$(ram_usage_pct)"; cpu="$(cpu_usage)"; disk="$(disk_usage)"
+    echo -e "${AZUL}╔════════════════════════════════════════════════════════════╗${FIN}"
+    echo -e "${AZUL}║${FIN}                 ${BLANCO}INFORMACIÓN DEL SISTEMA${FIN}                 ${AZUL}║${FIN}"
+    echo -e "${AZUL}╚════════════════════════════════════════════════════════════╝${FIN}"
     echo
-    echo -e "${AMARILLO}SISTEMA${FIN}"
-    echo " OS        : $os"
-    echo " Kernel    : $kernel"
-    echo " Arquitect.: $arch"
-    echo " IP        : ${ip:-N/D}"
-    echo " Uptime    : ${uptime_s:-N/D}"
-    echo
-    echo -e "${AMARILLO}CPU${FIN}"
-    echo " Cores     : $cores"
-    echo " Uso       : ${cpu}%"
-    echo " Load avg  : $load"
-    echo
-    echo -e "${AMARILLO}MEMORIA RAM${FIN}"
-    echo " Usada     : $ram_used / $ram_total"
-    echo " Uso       : ${ram_pct}%"
-    echo
-    echo -e "${AMARILLO}DISCO /${FIN}"
-    echo " Uso       : $disk"
-    echo
-    echo -e "${AMARILLO}TODOS LOS PUERTOS ESCUCHANDO${FIN}"
+    printf "${CIAN}%-22s${FIN} ${BLANCO}%-38s${FIN}\n" "SISTEMA" "RECURSOS"
     echo "------------------------------------------------------------"
-
-    local tcp udp
-    tcp="$(ss -H -lntp 2>/dev/null)"
-    udp="$(ss -H -lnup 2>/dev/null)"
-
-    if [ -n "$tcp" ]; then
-        echo -e "${CIAN}TCP${FIN}"
-        printf '%s\n' "$tcp"
-    else
-        echo "TCP: ninguno"
-    fi
-
+    printf "OS       : %-16s   CPU    : %-20s\n" "$os" "${cpu}% / $(nproc) cores"
+    printf "Kernel   : %-16s   RAM    : %-20s\n" "$kernel" "$ram_used / $ram_total ($ram_pct%)"
+    printf "Arch     : %-16s   DISCO  : %-20s\n" "$arch" "$disk"
+    printf "IP       : %-16s   UPTIME : %-20s\n" "$ip" "$uptime_s"
     echo
-    if [ -n "$udp" ]; then
-        echo -e "${CIAN}UDP${FIN}"
-        printf '%s\n' "$udp"
-    else
-        echo "UDP: ninguno"
-    fi
-
+    echo -e "${AMARILLO}PUERTOS SSH SILK${FIN}"
+    echo "------------------------------------------------------------"
+    local d b
+    d=""; b=""
+    [[ -f "$DROPBEAR_PORTS_FILE" ]] && d="$(cat "$DROPBEAR_PORTS_FILE")"
+    [[ -f "$BADVPN_PORTS_FILE" ]] && b="$(cat "$BADVPN_PORTS_FILE")"
+    echo -e "Dropbear : ${BLANCO}${d:-Ninguno}${FIN}"
+    [[ -n "$d" ]] && puertos_tcp_ui "$d"
+    echo -e "WebSocket: ${BLANCO}80/tcp${FIN}  $(tcp_listening 80 && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")"
+    echo -e "WSS      : ${BLANCO}443/tcp${FIN} $(tcp_listening 443 && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")"
+    echo -e "BadVPN   : ${BLANCO}${b:-Ninguno}${FIN}"
+    [[ -n "$b" ]] && puertos_udp_ui "$b"
     echo
-    echo -e "${AMARILLO}FIREWALL UFW${FIN}"
-    if command -v ufw >/dev/null 2>&1; then
-        ufw status 2>/dev/null | head -n 25
-    else
-        echo "UFW no instalado."
-    fi
-
-    pause_menu
+    echo -e "${AMARILLO}TODOS LOS PUERTOS EN ESCUCHA${FIN}"
+    echo "------------------------------------------------------------"
+    ss -H -lntup 2>/dev/null | sed 's/users:((/users: ((/' | head -80
+    echo
+    echo -e "${AMARILLO}FIREWALL${FIN}: $(ufw status 2>/dev/null | head -1 || echo 'UFW no disponible')"
+    pausa
 }
 
-# ============================================================
-# DIAGNÓSTICO DE PUERTOS
-# ============================================================
+# ---------------------- USUARIOS ----------------------
 
-diagnostic() {
+crear_usuario() {
+    clear; echo -e "${CIAN}⚡ SSH SILK • CREAR USUARIO${FIN}"
+    read -r -p "Usuario: " u
+    id "$u" >/dev/null 2>&1 && { echo -e "${ROJO}❌ Ya existe.${FIN}"; pausa; return; }
+    read -r -s -p "Contraseña: " pass; echo
+    read -r -p "Días: " dias
+    [[ "$dias" =~ ^[0-9]+$ ]] || { echo "Días inválidos."; pausa; return; }
+    local fecha; fecha="$(date -d "+$dias days" +%Y-%m-%d)"
+    useradd -M -s /bin/false -e "$fecha" "$u" && echo "$u:$pass" | chpasswd
+    echo -e "${VERDE}✅ Usuario creado. Expira: $fecha${FIN}"; pausa
+}
+crear_test() {
+    clear; local u="silk$(date +%s | tail -c 5)"
+    useradd -M -s /bin/false -e "$(date -d '+1 day' +%Y-%m-%d)" "$u" && echo "$u:1234" | chpasswd
+    echo -e "${VERDE}✅ Test creado${FIN}\nUsuario: $u\nPass: 1234"; pausa
+}
+eliminar_usuario() {
+    clear; read -r -p "Usuario a eliminar: " u
+    if id "$u" >/dev/null 2>&1; then userdel -f "$u" >/dev/null 2>&1; echo -e "${VERDE}✅ Eliminado.${FIN}"
+    else echo -e "${ROJO}❌ No existe.${FIN}"; fi
+    pausa
+}
+listar_usuarios() {
+    clear; echo -e "${CIAN}👥 USUARIOS SSH${FIN}"; echo "------------------------------------------------------------"
+    awk -F: '$3 >= 1000 && $1 != "nobody" {print " • " $1}' /etc/passwd
+    pausa
+}
+
+# ---------------------- DIAGNOSTICO / UPDATE ----------------------
+
+diagnostico() {
     clear
-    echo -e "${MAGENTA}⚡ SSH SILK • DIAGNÓSTICO${FIN}"
+    echo -e "${CIAN}⚡ SSH SILK • DIAGNÓSTICO${FIN}"
     echo "============================================================"
-
-    local db="" bv=""
-    [ -f "$DROPBEAR_PORTS_FILE" ] && db="$(cat "$DROPBEAR_PORTS_FILE")"
-    [ -f "$BADVPN_PORTS_FILE" ] && bv="$(cat "$BADVPN_PORTS_FILE")"
-
+    echo "DROPBEAR"; [[ -f "$DROPBEAR_PORTS_FILE" ]] && puertos_tcp_ui "$(cat "$DROPBEAR_PORTS_FILE")" || echo "  Ninguno"
+    echo "WEBSOCKET"; puertos_tcp_ui "80"
+    echo "WSS"; puertos_tcp_ui "443"
+    echo "BADVPN"; [[ -f "$BADVPN_PORTS_FILE" ]] && puertos_udp_ui "$(cat "$BADVPN_PORTS_FILE")" || echo "  Ninguno"
     echo
-    echo -e "${CIAN}DROPBEAR${FIN}"
-    tcp_status_list "$db"
-
+    systemctl --no-pager --plain --type=service --state=failed 2>/dev/null | head -20
     echo
-    echo -e "${CIAN}WEBSOCKET :80${FIN}"
-    tcp_status_list "80"
-
-    echo
-    echo -e "${CIAN}WSS :443${FIN}"
-    tcp_status_list "443"
-
-    echo
-    echo -e "${CIAN}BADVPN${FIN}"
-    udp_status_list "$bv"
-
-    echo
-    echo -e "${CIAN}SERVICIOS${FIN}"
-    for svc in silk-dropbear.service silk-websocket.service stunnel4; do
-        printf " %-30s : " "$svc"
-        systemctl is-active "$svc" 2>/dev/null || echo "OFF"
-    done
-
-    echo
-    echo -e "${CIAN}PUERTOS ESCUCHANDO${FIN}"
-    ss -lntup 2>/dev/null | head -n 50
-
-    echo
-    echo -e "${AMARILLO}LOGS ÚTILES${FIN}"
-    echo "journalctl -u silk-dropbear.service -n 50 --no-pager"
-    echo "journalctl -u silk-websocket.service -n 50 --no-pager"
-    echo "journalctl -u stunnel4 -n 50 --no-pager"
-
-    pause_menu
+    echo "Puertos:"
+    ss -lntup 2>/dev/null
+    pausa
 }
 
-# ============================================================
-# ACTUALIZACIÓN ONLINE SEGURA
-# ============================================================
-
-online_update() {
+actualizar_online() {
     clear
     echo -e "${CIAN}⚡ SSH SILK • ACTUALIZACIÓN ONLINE${FIN}"
     echo "============================================================"
-    echo "Versión actual : v$VERSION"
-    echo "Fuente         : GitHub"
-    echo
-
-    local tmp="/tmp/ssh_silk_update_$$.sh"
-    local old_backup="/tmp/ssh_silk_old_$$.sh"
-
-    echo "Descargando..."
-    if ! curl -fLsS --connect-timeout 10 --max-time 60 "$GITHUB_RAW_URL" -o "$tmp"; then
-        echo -e "${ROJO}❌ Falló la descarga.${FIN}"
-        rm -f "$tmp"
-        pause_menu
-        return
+    local tmp backup
+    tmp="$(mktemp "$BASE/update.XXXXXX")"; backup="$BASE/SSH-SILK.backup.$(date +%Y%m%d-%H%M%S)"
+    if ! curl -fsSL --retry 3 --connect-timeout 10 "$GITHUB_RAW" -o "$tmp"; then
+        rm -f "$tmp"; echo -e "${ROJO}❌ No se pudo descargar la actualización.${FIN}"; pausa; return
     fi
-
-    if [ ! -s "$tmp" ] || ! grep -q "SSH SILK" "$tmp"; then
-        echo -e "${ROJO}❌ El archivo descargado no parece SSH SILK.${FIN}"
-        rm -f "$tmp"
-        pause_menu
-        return
+    if ! grep -q 'SSH SILK MANAGER' "$tmp" || ! bash -n "$tmp"; then
+        rm -f "$tmp"; echo -e "${ROJO}❌ La actualización no pasó la validación.${FIN}"; pausa; return
     fi
-
-    if ! bash -n "$tmp"; then
-        echo -e "${ROJO}❌ La actualización tiene errores de sintaxis.${FIN}"
-        echo "La versión actual NO fue modificada."
-        rm -f "$tmp"
-        pause_menu
-        return
-    fi
-
-    local remote_version
-    remote_version="$(grep -m1 '^VERSION=' "$tmp" | sed -E 's/^VERSION=["'\''"]?([^"'"'"''"]+)["'\''"]?.*/\1/')"
-
-    if [ -z "$remote_version" ]; then
-        echo -e "${ROJO}❌ No se pudo detectar la versión remota.${FIN}"
-        rm -f "$tmp"
-        pause_menu
-        return
-    fi
-
-    if [ "$remote_version" = "$VERSION" ]; then
-        echo -e "${AMARILLO}ℹ Ya tienes la versión v$VERSION.${FIN}"
-        rm -f "$tmp"
-        pause_menu
-        return
-    fi
-
-    # Evitar que una versión vieja de GitHub reemplace una más nueva.
-    if command -v sort >/dev/null 2>&1; then
-        if [ "$(printf '%s\n' "$remote_version" "$VERSION" | sort -V | tail -n1)" != "$remote_version" ]; then
-            echo -e "${ROJO}❌ La versión de GitHub (v$remote_version) es anterior a v$VERSION.${FIN}"
-            echo "No se realizó ningún cambio."
-            rm -f "$tmp"
-            pause_menu
-            return
-        fi
-    fi
-
-    cp "$INSTALL_PATH" "$old_backup" 2>/dev/null || true
-    chmod 755 "$tmp"
-    cp "$tmp" "$INSTALL_PATH"
-    chmod 755 "$INSTALL_PATH"
+    cp "$0" "$backup" 2>/dev/null || true
+    install -m 755 "$tmp" "$BIN/menu"
     rm -f "$tmp"
-
     echo -e "${VERDE}✅ Actualización instalada correctamente.${FIN}"
-    echo "La configuración de /etc/silk se conserva."
-    echo "Reiniciando el panel..."
-    sleep 2
-    exec "$INSTALL_PATH"
+    echo "Versión: $("$BIN/menu" --version 2>/dev/null || echo "$VERSION")"
+    read -r -p "Presiona Enter para reiniciar el panel..."
+    exec "$BIN/menu"
 }
 
-# ============================================================
-# DESINSTALACIÓN
-# ============================================================
+mostrar_version() { echo "SSH SILK Manager v$VERSION"; }
 
-uninstall_script() {
-    clear
-    echo -e "${ROJO}⚠️ SSH SILK • DESINSTALACIÓN${FIN}"
-    echo "============================================================"
-    read -r -p "¿Eliminar servicios y configuración de SSH SILK? (s/n): " opt
-    [[ "$opt" == "s" || "$opt" == "S" ]] || return
+configurar_alias() {
+    cp "$0" "$BIN/menu" >/dev/null 2>&1 || true
+    chmod +x "$BIN/menu" >/dev/null 2>&1 || true
+    grep -qF "alias menu='$BIN/menu'" /root/.bashrc 2>/dev/null || echo "alias menu='$BIN/menu'" >> /root/.bashrc
+    grep -qF "alias silk='$BIN/menu'" /root/.bashrc 2>/dev/null || echo "alias silk='$BIN/menu'" >> /root/.bashrc
+}
 
-    local db="" bv="" p
-    [ -f "$DROPBEAR_PORTS_FILE" ] && db="$(cat "$DROPBEAR_PORTS_FILE")"
-    [ -f "$BADVPN_PORTS_FILE" ] && bv="$(cat "$BADVPN_PORTS_FILE")"
-
-    systemctl disable --now silk-dropbear.service >/dev/null 2>&1 || true
-    systemctl disable --now silk-websocket.service >/dev/null 2>&1 || true
-    systemctl disable --now stunnel4 >/dev/null 2>&1 || true
-    stop_badvpn_ports "$bv"
-
-    close_tcp $db
-    close_tcp 80 443
-    close_udp $bv
-
-    rm -f "$SYSTEMD/silk-dropbear.service" \
-          "$SYSTEMD/silk-websocket.service" \
-          "$SYSTEMD/silk-badvpn@.service"
-
+desinstalar() {
+    clear; echo -e "${ROJO}⚠ DESINSTALAR SSH SILK${FIN}"
+    read -r -p "Confirmar (s/n): " r; [[ "$r" =~ ^[sS]$ ]] || return
+    local d b
+    d=""; b=""
+    [[ -f "$DROPBEAR_PORTS_FILE" ]] && d="$(cat "$DROPBEAR_PORTS_FILE")"
+    [[ -f "$BADVPN_PORTS_FILE" ]] && b="$(cat "$BADVPN_PORTS_FILE")"
+    systemctl disable --now silk-dropbear.service silk-websocket.service silk-badvpn.service stunnel4 >/dev/null 2>&1 || true
+    systemctl disable --now dropbear.service dropbear.socket >/dev/null 2>&1 || true
+    fw_tcp_close $d 80 443; fw_udp_close $b
+    rm -f "$SYSTEMD/silk-dropbear.service" "$SYSTEMD/silk-websocket.service" "$SYSTEMD/silk-badvpn.service"
     systemctl daemon-reload
-
-    unmask_native_dropbear
-
     rm -rf "$BASE"
-    rm -f "$INSTALL_PATH"
-    sed -i "/alias menu='$INSTALL_PATH'/d" /root/.bashrc 2>/dev/null || true
-    sed -i "/alias silk='$INSTALL_PATH'/d" /root/.bashrc 2>/dev/null || true
-
-    echo -e "${VERDE}✅ SSH SILK desinstalado.${FIN}"
-    exit 0
+    rm -f "$BIN/menu"
+    sed -i "/alias menu='$BIN\/menu'/d;/alias silk='$BIN\/menu'/d" /root/.bashrc 2>/dev/null || true
+    echo -e "${VERDE}✅ SSH SILK desinstalado.${FIN}"; exit 0
 }
 
-# ============================================================
-# PANEL
-# ============================================================
+# ---------------------- PANEL ----------------------
 
-repeat_char() {
-    local char="$1" count="$2"
-    printf "%${count}s" "" | tr ' ' "$char"
+status_word() { "$1" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}"; }
+online_users() { who 2>/dev/null | wc -l; }
+total_users() { awk -F: '$3 >= 1000 && $1 != "nobody" {n++} END{print n+0}' /etc/passwd; }
+expired_users() { awk -F: -v d="$(date +%s)" '$3 >= 1000 && $1 != "nobody" && $8 != 0 && $8 < d {n++} END{print n+0}' /etc/shadow 2>/dev/null; }
+
+estado_dropbear() { systemctl is-active --quiet silk-dropbear.service; }
+estado_ws() { tcp_listening 80; }
+estado_wss() { tcp_listening 443; }
+estado_badvpn() { local b p; [[ -f "$BADVPN_PORTS_FILE" ]] || return 1; b="$(cat "$BADVPN_PORTS_FILE")"; for p in $b; do udp_listening "$p" && return 0; done; return 1; }
+todos_tcp_activos() { local p; for p in $1; do tcp_listening "$p" || return 1; done; return 0; }
+todos_udp_activos() { local p; for p in $1; do udp_listening "$p" || return 1; done; return 0; }
+
+barra() {
+    local pct="${1:-0}" n=$((pct/10)) out="" i
+    ((n<0)) && n=0; ((n>10)) && n=10
+    for ((i=0;i<n;i++)); do out+="█"; done
+    for ((i=n;i<10;i++)); do out+="░"; done
+    printf "%s %d%%" "$out" "$pct"
 }
 
-bar() {
-    local pct="$1" total=10 filled empty
-    filled=$((pct / 10))
-    [ "$filled" -lt 0 ] && filled=0
-    [ "$filled" -gt 10 ] && filled=10
-    empty=$((10-filled))
-    printf "["
-    printf "■%.0s" $(seq 1 "$filled") 2>/dev/null
-    printf "·%.0s" $(seq 1 "$empty") 2>/dev/null
-    printf "]"
-}
-
-panel_status() {
-    local p="$1"
-    if [ "$2" = "udp" ]; then
-        udp_listening "$p" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}"
-    else
-        tcp_listening "$p" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}"
-    fi
-}
-
-draw_panel() {
-    local os ram_pct cpu_pct ram_total ram_used disk connected expired total
-    os="$(lsb_release -ds 2>/dev/null || grep PRETTY_NAME /etc/os-release | cut -d= -f2 | tr -d '"')"
-    ram_pct="$(ram_percent)"
-    cpu_pct="$(cpu_percent)"
-    ram_total="$(free -h | awk '/Mem:/ {print $2}')"
-    ram_used="$(free -h | awk '/Mem:/ {print $3}')"
-    disk="$(disk_info)"
-    connected="$(get_ssh_connections)"
-    expired="$(get_expired_users)"
-    total="$(get_total_users)"
-
-    local db="" bv=""
-    [ -f "$DROPBEAR_PORTS_FILE" ] && db="$(cat "$DROPBEAR_PORTS_FILE")"
-    [ -f "$BADVPN_PORTS_FILE" ] && bv="$(cat "$BADVPN_PORTS_FILE")"
-
-    local W=66
-    local line
-    line="$(repeat_char '═' "$W")"
-
-    echo -e "${AZUL}╔${line}╗${FIN}"
-    printf "${AZUL}║${FIN} %-64s ${AZUL}║${FIN}\n" "⚡ SSH SILK MANAGER v$VERSION"
-    printf "${AZUL}║${FIN} %-64s ${AZUL}║${FIN}\n" "★ VENTAS • SOPORTE • MULTI-PUERTO ★"
-    echo -e "${AZUL}╠${line}╣${FIN}"
-
-    printf "${AZUL}║${FIN} ${CIAN}SISTEMA${FIN} %-19s ${CIAN}RAM${FIN} %-18s ${CIAN}CPU${FIN} %-14s ${AZUL}║${FIN}\n" "" "" ""
-    printf "${AZUL}║${FIN} OS: %-23s RAM: %s %-4s CPU: %s %-3s ${AZUL}║${FIN}\n" \
-        "$(echo "$os" | cut -c1-23)" "$(bar "$ram_pct")" "$ram_pct%" "$(bar "$cpu_pct")" "$cpu_pct%"
-    printf "${AZUL}║${FIN} Hora: %-20s Usada: %-15s Cores: %-3s Uptime: %-13s ${AZUL}║${FIN}\n" \
-        "$(date '+%H:%M:%S')" "$ram_used/$ram_total" "$(nproc)" "$(uptime_human | cut -c1-13)"
-
-    echo -e "${AZUL}╠${line}╣${FIN}"
-    printf "${AZUL}║${FIN} ${VERDE}●${FIN} CONECTADOS: %-4s ${ROJO}●${FIN} VENCIDOS: %-4s ${CIAN}Σ${FIN} TOTAL: %-5s DISCO: %-15s ${AZUL}║${FIN}\n" \
-        "$connected" "$expired" "$total" "$disk"
-
-    echo -e "${AZUL}╠${line}╣${FIN}"
-    printf "${AZUL}║${FIN} ${AMARILLO}PROTOCOLOS${FIN}   SSH: ${BLANCO}22${FIN} [%b]   WS: ${BLANCO}80${FIN} [%b]   WSS: ${BLANCO}443${FIN} [%b] ${AZUL}║${FIN}\n" \
-        "$(panel_status 22 tcp)" "$(panel_status 80 tcp)" "$(panel_status 443 tcp)"
-    printf "${AZUL}║${FIN} DROPBEAR: %-18s BADVPN: %-18s STUNNEL: %b ${AZUL}║${FIN}\n" \
-        "${db:-OFF}" "${bv:-OFF}" "$(service_on stunnel4 && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")"
-
-    echo -e "${AZUL}╠${line}╣${FIN}"
-    printf "${AZUL}║${FIN} ${MAGENTA}ADMINISTRACIÓN${FIN}              ${CIAN}CONFIGURACIÓN${FIN}             ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN} ${MAGENTA}[01]${FIN} Crear usuario              ${CIAN}[06]${FIN} WebSocket HTTP 80         ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN} ${MAGENTA}[02]${FIN} Usuario prueba             ${CIAN}[07]${FIN} WebSocket Security 443    ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN} ${MAGENTA}[03]${FIN} Online / Consumos          ${CIAN}[08]${FIN} BadVPN multi-puerto       ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN} ${MAGENTA}[04]${FIN} Lista de usuarios          ${CIAN}[09]${FIN} Diagnóstico de puertos     ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN} ${MAGENTA}[05]${FIN} Eliminar usuario           ${CIAN}[10]${FIN} Info de sistema            ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN}                                ${CIAN}[11]${FIN} Actualizar online          ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN}                                ${CIAN}[12]${FIN} Dropbear multi-puerto      ${AZUL}║${FIN}\n"
-    printf "${AZUL}║${FIN}                                ${CIAN}[13]${FIN} Desinstalar script         ${AZUL}║${FIN}"
-    echo
-    echo -e "${AZUL}╠${line}╣${FIN}"
-    printf "${AZUL}║${FIN} ${ROJO}[00]${FIN} Salir    ${GRIS}Systemd • Multi-puerto • Diagnóstico • AutoStart${FIN} ${AZUL}║${FIN}\n"
-    echo -e "${AZUL}╚${line}╝${FIN}"
-}
-
-# ============================================================
-# INICIO
-# ============================================================
-
-install_dependencies || exit 1
-install_alias
-
-while true; do
+panel() {
+    obtener_panel_info
+    local d b
+    d=""; b=""
+    [[ -f "$DROPBEAR_PORTS_FILE" ]] && d="$(cat "$DROPBEAR_PORTS_FILE")"
+    [[ -f "$BADVPN_PORTS_FILE" ]] && b="$(cat "$BADVPN_PORTS_FILE")"
     clear
-    draw_panel
+    echo -e "${AZUL}╔════════════════════════════════════════════════════════════╗${FIN}"
+    echo -e "${AZUL}║${FIN}            ${BLANCO}⚡ SSH SILK MANAGER PRO v$VERSION ⚡${FIN}            ${AZUL}║${FIN}"
+    echo -e "${AZUL}╚════════════════════════════════════════════════════════════╝${FIN}"
     echo
-    read -r -p " 👉 Selecciona una opción: " option
+    printf "${CIAN}%-20s${FIN} ${CIAN}%-20s${FIN} ${CIAN}%-20s${FIN}\n" "SISTEMA" "MEMORIA RAM" "PROCESADOR"
+    printf "OS: %-16s " "$PANEL_OS"
+    printf "Total: %-12s " "$PANEL_RAM_TOTAL"
+    printf "Cores: %-12s\n" "$PANEL_CORES"
+    printf "Hora: %-14s " "$PANEL_HORA"
+    printf "Uso: %-15s " "$(barra "$PANEL_RAM_PCT")"
+    printf "Uso: %-15s\n" "$(barra "$PANEL_CPU_PCT")"
+    echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
+    printf "${VERDE}● Online: %-8s${FIN} ${ROJO}● Expirados: %-8s${FIN} ${AMARILLO}● Total: %-8s${FIN}\n" "$(online_users)" "$(expired_users)" "$(total_users)"
+    echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
+    echo -e "${CIAN}PROTOCOLOS ACTIVOS${FIN}"
+    printf "  ${VERDE}●${FIN} OPENSSH:22   ${status_word estado_dropbear}    ${VERDE}●${FIN} WEBSOCKET:80  %b\n" "$(status_word estado_ws)"
+    printf "  ${VERDE}●${FIN} DROPBEAR:%-6s ${VERDE}●${FIN} BADVPN:%-7s ${VERDE}●${FIN} WSS:443       %b\n" "${d:-—}" "${b:-—}" "$(status_word estado_wss)"
+    echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
+    printf "${CIAN}DROPBEAR: %-9b${FIN}   ${CIAN}BADVPN: %-9b${FIN}   ${CIAN}WSS: %-9b${FIN}\n" "$(status_word estado_dropbear)" "$(status_word estado_badvpn)" "$(status_word estado_wss)"
+    echo -e "${AZUL}╭────────────────────────────╮  ╭────────────────────────────╮${FIN}"
+    echo -e "${MAGENTA}│ ADMINISTRACIÓN              │  ${CIAN}│ CONFIGURACIONES            │${FIN}"
+    echo -e "│ ${BLANCO}[01]${FIN} Crear usuario          │  │ ${BLANCO}[06]${FIN} WebSocket HTTP 80       │"
+    echo -e "│ ${BLANCO}[02]${FIN} Usuario prueba         │  │ ${BLANCO}[07]${FIN} WebSocket Security 443  │"
+    echo -e "│ ${BLANCO}[03]${FIN} Usuarios online        │  │ ${BLANCO}[08]${FIN} BadVPN multi-puerto      │"
+    echo -e "│ ${BLANCO}[04]${FIN} Lista usuarios         │  │ ${BLANCO}[09]${FIN} Diagnóstico de puertos   │"
+    echo -e "│ ${BLANCO}[05]${FIN} Eliminar usuario       │  │ ${BLANCO}[10]${FIN} Info de sistema          │"
+    echo -e "│                            │  │ ${BLANCO}[11]${FIN} Actualizar online        │"
+    echo -e "│                            │  │ ${BLANCO}[12]${FIN} Dropbear multi-puerto    │"
+    echo -e "╰────────────────────────────╯  ╰────────────────────────────╯"
+    echo -e " ${ROJO}[00]${FIN} Salir"
+    echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
+    read -r -p "👉 INFORME UNA OPCIÓN: " opcion
+}
 
-    case "$option" in
-        1|01) create_user ;;
-        2|02) create_test ;;
-        3|03)
-            clear
-            echo -e "${CIAN}⚡ ONLINE / CONSUMOS${FIN}"
-            echo "Conectados: $(get_ssh_connections)"
-            ss -H -tn state established 2>/dev/null
-            pause_menu
-            ;;
-        4|04) list_users ;;
-        5|05) delete_user ;;
-        6|06) manage_websocket ;;
-        7|07) manage_wss ;;
-        8|08) manage_badvpn ;;
-        9|09) diagnostic ;;
-        10) system_info ;;
-        11) online_update ;;
-        12) manage_dropbear ;;
-        13) uninstall_script ;;
-        0|00) clear; exit 0 ;;
-        *) echo -e "${ROJO}❌ Opción inválida.${FIN}"; sleep 1 ;;
+obtener_panel_info() {
+    PANEL_OS="$(lsb_release -ds 2>/dev/null || sed -n 's/^PRETTY_NAME=//p' /etc/os-release | tr -d '"')"
+    PANEL_HORA="$(date +%H:%M:%S)"
+    PANEL_CORES="$(nproc)"
+    PANEL_RAM_TOTAL="$(free -h | awk '/Mem:/ {print $2}')"
+    PANEL_RAM_PCT="$(ram_usage_pct)"
+    PANEL_CPU_PCT="$(cpu_usage)"
+}
+
+inicializar() {
+    instalar_dependencias || exit 1
+    systemctl daemon-reload
+    configurar_alias
+}
+
+case "${1:-}" in
+  --version) mostrar_version; exit 0 ;;
+esac
+
+inicializar
+while true; do
+    panel
+    case "$opcion" in
+      1|01) crear_usuario ;; 2|02) crear_test ;; 3|03) clear; echo "Online: $(online_users)"; ps -eo user,pid,cmd | grep -E '[s]shd|[d]ropbear' | head -50; pausa ;;
+      4|04) listar_usuarios ;; 5|05) eliminar_usuario ;;
+      6|06) gestionar_websocket ;; 7|07) gestionar_wss ;; 8|08) gestionar_badvpn ;;
+      9|09) diagnostico ;; 10) info_sistema ;; 11) actualizar_online ;; 12) gestionar_dropbear ;;
+      0|00) clear; exit 0 ;;
+      *) echo -e "${ROJO}❌ Opción inválida.${FIN}"; sleep 1 ;;
     esac
 done
