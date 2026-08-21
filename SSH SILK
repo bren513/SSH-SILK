@@ -7,7 +7,7 @@
 
 set -o pipefail
 
-VERSION="5.0.0"
+VERSION="5.0.1"
 GITHUB_RAW="https://raw.githubusercontent.com/bren513/SSH-SILK/refs/heads/main/SSH%20SILK"
 BASE="/etc/silk"
 BIN="/usr/local/bin"
@@ -695,8 +695,9 @@ desinstalar() {
 status_word() { "$1" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}"; }
 online_users() { who 2>/dev/null | wc -l; }
 total_users() { awk -F: '$3 >= 1000 && $1 != "nobody" {n++} END{print n+0}' /etc/passwd; }
-expired_users() { awk -F: -v d="$(date +%s)" '$3 >= 1000 && $1 != "nobody" && $8 != 0 && $8 < d {n++} END{print n+0}' /etc/shadow 2>/dev/null; }
+expired_users() { local d; d=$(( $(date +%s) / 86400 )); awk -F: -v d="$d" '$3 >= 1000 && $1 != "nobody" && $8 != "" && $8 != 0 && $8 < d {n++} END{print n+0}' /etc/shadow 2>/dev/null; }
 
+estado_ssh() { tcp_listening 22 || tcp_listening 2222; }
 estado_dropbear() { systemctl is-active --quiet silk-dropbear.service; }
 estado_ws() { tcp_listening 80; }
 estado_wss() { tcp_listening 443; }
@@ -734,7 +735,7 @@ panel() {
     printf "${VERDE}● Online: %-8s${FIN} ${ROJO}● Expirados: %-8s${FIN} ${AMARILLO}● Total: %-8s${FIN}\n" "$(online_users)" "$(expired_users)" "$(total_users)"
     echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
     echo -e "${CIAN}PROTOCOLOS ACTIVOS${FIN}"
-    printf "  ${VERDE}●${FIN} OPENSSH:22   ${status_word estado_dropbear}    ${VERDE}●${FIN} WEBSOCKET:80  %b\n" "$(status_word estado_ws)"
+    printf "  ${VERDE}●${FIN} OPENSSH:22   %b    ${VERDE}●${FIN} WEBSOCKET:80  %b\n" "$(status_word estado_ssh)" "$(status_word estado_ws)"
     printf "  ${VERDE}●${FIN} DROPBEAR:%-6s ${VERDE}●${FIN} BADVPN:%-7s ${VERDE}●${FIN} WSS:443       %b\n" "${d:-—}" "${b:-—}" "$(status_word estado_wss)"
     echo -e "${AZUL}────────────────────────────────────────────────────────────${FIN}"
     printf "${CIAN}DROPBEAR: %-9b${FIN}   ${CIAN}BADVPN: %-9b${FIN}   ${CIAN}WSS: %-9b${FIN}\n" "$(status_word estado_dropbear)" "$(status_word estado_badvpn)" "$(status_word estado_wss)"
