@@ -1,16 +1,14 @@
 #!/bin/bash
 # =========================================================
-# SCRIPT: SSH SILK - PREMIUM EDITION (FULL SYNTAX FIX)
+# SCRIPT: SSH SILK - PREMIUM EDITION (CORRECCIÓN LINODE)
 # COMPATIBLE CON: UBUNTU 20.04 / 22.04 / 24.04 Y DEBIAN
 # =========================================================
 
-# Verificar ejecución como root
 if [ "$EUID" -ne 0 ]; then
   echo -e "\e[1;31m❌ Por favor, ejecuta este script como root (sudo).\e[0m"
   exit 1
 fi
 
-# Colores ANSI
 VERDE="\e[1;32m"
 ROJO="\e[1;31m"
 AZUL="\e[1;34m"
@@ -20,10 +18,9 @@ MAGENTA="\e[1;35m"
 BLANCO="\e[1;37m"
 FIN="\e[0m"
 
-# ⚙️ INSTALACIÓN AUTOMÁTICA DE DEPENDENCIAS
 instalar_dependencias() {
     apt-get update -y &>/dev/null
-    DEPENDENCIAS=(lsb-release ufw bc gawk host dropbear stunnel4 python3 python3-pip screen wget curl openssl)
+    DEPENDENCIAS=(lsb-release ufw bc gawk host dropbear stunnel4 python3 screen wget curl openssl)
     for dev_dep in "${DEPENDENCIAS[@]}"; do
         if ! command -v "$dev_dep" &>/dev/null && [ ! -f "/usr/bin/$dev_dep" ] && [ ! -f "/usr/sbin/$dev_dep" ]; then
             apt-get install -y "$dev_dep" &>/dev/null
@@ -32,11 +29,9 @@ instalar_dependencias() {
 }
 instalar_dependencias
 
-# Asegurar persistencia y comando "menu" global
 configurar_alias_y_inicio() {
     cp "$0" /usr/local/bin/menu &>/dev/null
     chmod +x /usr/local/bin/menu &>/dev/null
-    
     if ! grep -q "alias menu=" /root/.bashrc; then
         echo "alias menu='/usr/local/bin/menu'" >> /root/.bashrc
         echo "alias silk='/usr/local/bin/menu'" >> /root/.bashrc
@@ -44,7 +39,6 @@ configurar_alias_y_inicio() {
 }
 configurar_alias_y_inicio
 
-# Métricas del hardware en tiempo real
 obtener_info_sistema() {
     OS=$(lsb_release -ds 2>/dev/null || cat /etc/os-release | grep "PRETTY_NAME" | cut -d= -f2 | tr -d '"')
     HORA=$(date +"%H:%M:%S")
@@ -54,7 +48,6 @@ obtener_info_sistema() {
     CPU_USO_PCT=$(top -bn1 | grep "Cpu(s)" | sed "s/.*, *\([0-9.]*\)%* id.*/\1/" | awk '{print int(100 - $1)}')
     TOTAL_USERS=$(awk -F: '$3 >= 1000 && $1 != "nobody" {print $1}' /etc/passwd | wc -l)
     ONLINE_USERS=$(ps aux | grep -i sshd | grep -v grep | wc -l)
-    
     STATUS_DROPBEAR=$(systemctl is-active dropbear &>/dev/null && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")
     STATUS_WS=$(screen -list | grep -q "ws_80" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")
     STATUS_WSS=$(screen -list | grep -q "wss_security" && echo -e "${VERDE}ON${FIN}" || echo -e "${ROJO}OFF${FIN}")
@@ -72,9 +65,6 @@ dibujar_barra() {
     printf "] %d%%" "$pct"
 }
 
-# =========================================================
-# GESTIÓN DE USUARIOS
-# =========================================================
 crear_usuario() {
     clear
     echo -e "${VERDE}⚡ SSH SILK - CREAR USUARIO SSH ${FIN}"
@@ -126,9 +116,6 @@ listar_usuarios() {
     read -p "Enter para volver..."
 }
 
-# =========================================================
-# PROTOCOLOS: ACTIVACIÓN Y GESTIÓN
-# =========================================================
 gestionar_dropbear() {
     clear
     echo -e "${CIAN}⚡ SSH SILK - CONFIGURAR DROPBEAR ${FIN}"
@@ -162,8 +149,6 @@ gestionar_websocket() {
         fi
     else
         echo -e "Iniciando Proxy Python en Puerto 80 redirigido al SSH local (Puerto 22)..."
-        
-        # Generar script de Python de forma segura evitando conflictos de Bash
         echo "import socket, threading" > /tmp/ws80.py
         echo "def proxy(c, a):" >> /tmp/ws80.py
         echo "    try:" >> /tmp/ws80.py
@@ -187,7 +172,6 @@ gestionar_websocket() {
         echo "while True:" >> /tmp/ws80.py
         echo "    c, a = srv.accept()" >> /tmp/ws80.py
         echo "    threading.Thread(target=proxy, args=(c, a)).start()" >> /tmp/ws80.py
-
         ufw allow 80/tcp &>/dev/null
         screen -dmS ws_80 python3 /tmp/ws80.py
         echo -e "${VERDE}✅ WebSocket ejecutándose de fondo en puerto 80.${FIN}"
@@ -207,9 +191,7 @@ gestionar_websocket_security() {
             echo -e "${VERDE}✅ WebSocket Security y SSL desactivados.${FIN}"
         fi
     else
-        echo -e "Configurando proxy Python con encabezado HTTP 101 Switching Protocols..."
-        
-        # Generar script de Python seguro línea por línea para evitar EOF roto
+        echo -e "Configurando proxy Python..."
         echo "import socket, threading" > /tmp/wss.py
         echo "def proxy(c, a):" >> /tmp/wss.py
         echo "    try:" >> /tmp/wss.py
@@ -227,3 +209,14 @@ gestionar_websocket_security() {
         echo "            d = src.recv(4096)" >> /tmp/wss.py
         echo "            if not d: break" >> /tmp/wss.py
         echo "            dst.send(d)" >> /tmp/wss.py
+        echo "    except: pass" >> /tmp/wss.py
+        echo "    finally: src.close(); dst.close()" >> /tmp/wss.py
+        echo "srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)" >> /tmp/wss.py
+        echo "srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)" >> /tmp/wss.py
+        echo "srv.bind(('0.0.0.0', 80))" >> /tmp/wss.py
+        echo "srv.listen(100)" >> /tmp/wss.py
+        echo "while True:" >> /tmp/wss.py
+        echo "    c, a = srv.accept()" >> /tmp/wss.py
+        echo "    threading.Thread(target=proxy, args=(c, a)).start()" >> /tmp/wss.py
+        screen -dmS wss_security python3 /tmp/wss.py
+        mkdir -p /etc/stunnel &>/dev/null
