@@ -8,7 +8,7 @@
 
 set -u
 
-VERSION="5.0.3"
+VERSION="5.0.4"
 GITHUB_URL="https://raw.githubusercontent.com/bren513/SSH-SILK/refs/heads/main/SSH%20SILK"
 BIN="/usr/local/bin"
 DATA="/etc/ssh-silk"
@@ -408,15 +408,38 @@ dashboard(){
 }
 
 # ---------- user management ----------
+validar_usuario(){
+  local u="$1"
+  [[ "$u" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || return 1
+  [[ "$u" != *"--"* ]] || return 1
+}
+
 create_user(){
   header; say "${C}CREAR USUARIO SSH${N}"
-  read -r -p " Usuario: " u
+  read -r -p " Usuario (a-z, 0-9, _ o -): " u
+  u="${u,,}"
+  if ! validar_usuario "$u"; then
+    say "${R}❌ Nombre inválido.${N}"
+    say "${Y}Usa 1-32 caracteres: letras minúsculas, números, _ o -; debe comenzar con letra o _.${N}"
+    pause; return
+  fi
+  if id "$u" >/dev/null 2>&1; then
+    say "${R}❌ El usuario ya existe.${N}"; pause; return
+  fi
   read -r -s -p " Contraseña: " p; echo
-  read -r -p " Días: " d
-  if id "$u" >/dev/null 2>&1; then say "${R}❌ Usuario existente.${N}"; pause; return; fi
-  [[ "$d" =~ ^[0-9]+$ ]] || { say "${R}❌ Días inválidos.${N}"; pause; return; }
-  useradd -M -s /bin/false -e "$(date -d "+$d days" +%F)" "$u" && echo "$u:$p" | chpasswd
-  say "${G}✅ Usuario creado.${N}"; pause
+  [ -n "$p" ] || { say "${R}❌ La contraseña no puede estar vacía.${N}"; pause; return; }
+  read -r -p " Días de duración: " d
+  [[ "$d" =~ ^[0-9]+$ ]] && (( d >= 1 && d <= 3650 )) || { say "${R}❌ Días inválidos (1-3650).${N}"; pause; return; }
+  local fecha; fecha="$(date -d "+$d days" +%Y-%m-%d)"
+  if useradd -M -s /bin/false -e "$fecha" "$u" && echo "$u:$p" | chpasswd; then
+    say "${G}✅ Usuario creado correctamente.${N}"
+    say " Usuario: ${C}$u${N}"
+    say " Expira : ${W}$fecha${N}"
+  else
+    say "${R}❌ No se pudo crear el usuario.${N}"
+    say "${Y}El sistema rechazó el nombre o la configuración de useradd.${N}"
+  fi
+  pause
 }
 create_test(){
   local u="silk$(date +%s | tail -c 5)"
@@ -522,50 +545,63 @@ system_info(){
 
 update_online(){
   header; say "${C}ACTUALIZACIÓN ONLINE${N}"
-  local tmp remote_ver current_ver
-  tmp="$(mktemp)"
-  if ! curl -fsSL --connect-timeout 10 --max-time 60 "$GITHUB_URL" -o "$tmp"; then
-    rm -f "$tmp"; say "${R}❌ No se pudo descargar desde GitHub.${N}"; pause; return
+  local tmp remote_ver current_ver remote_num current_num
+  tmp="$(mktemp "$DATA/update.XXXXXX")"
+
+  say "${D}Descargando desde GitHub...${N}"
+  if ! curl -4 -fLsS --retry 3 --connect-timeout 10 --max-time 60 "$GITHUB_URL" -o "$tmp"; then
+    rm -f "$tmp"
+    say "${R}❌ No se pudo descargar la versión de GitHub.${N}"
+    say "${Y}Comprueba conectividad con:${N}"
+    say "curl -4 -I '$GITHUB_URL'"
+    pause; return
   fi
-  [ -s "$tmp" ] || { rm -f "$tmp"; say "${R}❌ Archivo vacío.${N}"; pause; return; }
-  head -n1 "$tmp" | grep -q '^#!/bin/bash' || { rm -f "$tmp"; say "${R}❌ Archivo remoto no válido.${N}"; pause; return; }
-  bash -n "$tmp" || { rm -f "$tmp"; say "${R}❌ La versión remota tiene errores de sintaxis.${N}"; pause; return; }
+
+  if [ ! -s "$tmp" ] || ! head -n 1 "$tmp" | grep -q '^#!/bin/bash$' ||
+     ! grep -q 'SSH SILK MANAGER' "$tmp" || ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    say "${R}❌ El archivo remoto no pasó la validación.${N}"
+    pause; return
+  fi
+
   remote_ver="$(grep -m1 '^VERSION=' "$tmp" | cut -d'"' -f2)"
-  [ -n "$remote_ver" ] || { rm -f "$tmp"; say "${R}❌ No se encontró VERSION.${N}"; pause; return; }
   current_ver="$VERSION"
-  say " Versión actual : ${Y}$current_ver${N}"
-  say " Versión GitHub : ${G}$remote_ver${N}"
-  cp "$MENU" "$BACKUP/menu-$current_ver-$(date +%s)" 2>/dev/null || true
+  say "Versión instalada : ${Y}$current_ver${N}"
+  say "Versión GitHub    : ${G}${remote_ver:-desconocida}${N}"
+
+  if [ -z "$remote_ver" ]; then
+    rm -f "$tmp"; say "${R}❌ GitHub no contiene VERSION.${N}"; pause; return
+  fi
+
+  remote_num="$(printf '%s' "$remote_ver" | awk -F. '{printf "%d%03d%03d",$1,$2,$3}')"
+  current_num="$(printf '%s' "$current_ver" | awk -F. '{printf "%d%03d%03d",$1,$2,$3}')"
+
+  if (( 10#$remote_num < 10#$current_num )); then
+    rm -f "$tmp"
+    say "${R}❌ La versión de GitHub es anterior. Se evita un downgrade.${N}"
+    pause; return
+  fi
+  if (( 10#$remote_num == 10#$current_num )); then
+    rm -f "$tmp"
+    say "${Y}⚠ Ya tienes la misma versión instalada.${N}"
+    pause; return
+  fi
+
+  local backup="$BACKUP/menu-$current_ver-$(date +%Y%m%d-%H%M%S).bak"
+  cp "$MENU" "$backup" 2>/dev/null || true
   install -m 755 "$tmp" "$MENU"
   rm -f "$tmp"
-  say "${G}✅ Actualización instalada correctamente.${N}"
-  say "${D}Volviendo a cargar el panel...${N}"
-  exec "$MENU"
-}
 
-toggle_autostart(){
-  header
-  if [ "${AUTOSTART:-0}" = 1 ]; then
-    AUTOSTART=0
-    sed -i '/# SSH-SILK-AUTOSTART/,/# SSH-SILK-AUTOSTART-END/d' /root/.bashrc 2>/dev/null || true
-    save_config
-    say "${R}● Auto iniciar: OFF${N}"
-  else
-    AUTOSTART=1
-    sed -i '/# SSH-SILK-AUTOSTART/,/# SSH-SILK-AUTOSTART-END/d' /root/.bashrc 2>/dev/null || true
-    cat >> /root/.bashrc <<'EOF'
-# SSH-SILK-AUTOSTART
-if [ -n "$SSH_CONNECTION" ] && [ "$-" = *i* ] && [ "${SILK_AUTOSTART_RUNNING:-0}" != "1" ] && [ -x /usr/local/bin/menu ]; then
-  export SILK_AUTOSTART_RUNNING=1
-  /usr/local/bin/menu
-  return
-fi
-# SSH-SILK-AUTOSTART-END
-EOF
-    save_config
-    say "${G}● Auto iniciar: ON${N}"
+  if ! bash -n "$MENU"; then
+    say "${R}❌ La nueva versión falló la validación. Restaurando...${N}"
+    [ -f "$backup" ] && install -m 755 "$backup" "$MENU"
+    pause; return
   fi
-  pause
+
+  say "${G}✅ Actualización instalada: v$remote_ver${N}"
+  say "${D}Reiniciando el panel...${N}"
+  sleep 1
+  exec "$MENU"
 }
 
 # ---------- safe installation ----------
